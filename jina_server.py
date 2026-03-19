@@ -44,24 +44,38 @@ os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
 
 # Check CPU capabilities
 def check_cpu_capabilities():
-    """Check CPU instruction set support."""
+    """Check CPU instruction set support using py-cpuinfo."""
+    import cpuinfo
+
     cpu_info = {
         "cpu_count": os.cpu_count(),
         "pytorch_threads": torch.get_num_threads(),
         "platform": platform.platform(),
+        "cpu_brand": cpuinfo.get_cpu_info().get("brand_raw", "Unknown"),
         "avx": False,
         "avx2": False,
         "avx512": False,
+        "avx512f": False,
+        "avx512_vnni": False,
     }
 
-    # Simple check through PyTorch compilation
-    try:
-        # Check if AVX is available via torch backend
-        cpu_info["avx"] = True  # Modern CPUs support AVX
-        cpu_info["avx2"] = True  # Modern CPUs support AVX2
-        cpu_info["avx512"] = False  # AVX-512 is rare, skip detection
-    except Exception:
-        pass
+    # Get all CPU flags
+    info = cpuinfo.get_cpu_info()
+    flags = info.get("flags", [])
+
+    # Check instruction set support
+    cpu_info["avx"] = "avx" in flags
+    cpu_info["avx2"] = "avx2" in flags
+    cpu_info["avx512f"] = "avx512f" in flags
+    cpu_info["avx512_vnni"] = "avx512vnni" in flags
+
+    # AVX512 considered supported if F (foundation) is present
+    cpu_info["avx512"] = cpu_info["avx512f"]
+
+    # Log detailed AVX512 subsets if available
+    if cpu_info["avx512"]:
+        avx512_subsets = [f for f in flags if f.startswith("avx512")]
+        cpu_info["avx512_subsets"] = avx512_subsets
 
     return cpu_info
 
@@ -86,12 +100,15 @@ async def lifespan(app: FastAPI):
     print("=" * 60)
     print("System Information")
     print("=" * 60)
-    print(f"  Platform:      {cpu_caps['platform']}")
-    print(f"  CPU Cores:     {cpu_caps['cpu_count']}")
+    print(f"  Platform:        {cpu_caps['platform']}")
+    print(f"  CPU:             {cpu_caps['cpu_brand']}")
+    print(f"  CPU Cores:       {cpu_caps['cpu_count']}")
     print(f"  PyTorch Threads: {cpu_caps['pytorch_threads']}")
-    print(f"  AVX Support:   {cpu_caps['avx']}")
-    print(f"  AVX2 Support:  {cpu_caps['avx2']}")
-    print(f"  AVX512 Support: {cpu_caps['avx512']}")
+    print(f"  AVX:             {cpu_caps['avx']}")
+    print(f"  AVX2:            {cpu_caps['avx2']}")
+    print(f"  AVX-512:         {cpu_caps['avx512']}")
+    if cpu_caps.get("avx512"):
+        print(f"  AVX-512 Subsets: {', '.join(cpu_caps.get('avx512_subsets', []))}")
     print("=" * 60)
 
     print("\nLoading models...")
