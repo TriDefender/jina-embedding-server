@@ -71,6 +71,8 @@ Run the test suite:
 ```bash
 uv run python test_server.py
 ```
+## WIP:
+I'm telling my opencode to implement avx512 for my 9900x rig, brb
 
 ## License
 
