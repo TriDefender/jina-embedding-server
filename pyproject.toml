@@ -17,6 +17,7 @@ dependencies = [
     "safetensors>=0.4.0",
     "requests>=2.31.0",
     "py-cpuinfo>=9.0.0",
+    "python-multipart>=0.0.20",
 ]
 
 [project.optional-dependencies]

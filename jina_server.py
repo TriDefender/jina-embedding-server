@@ -5,18 +5,26 @@ OpenAI-compatible API for embeddings + reranking
 Endpoints:
   - POST /v1/embeddings  (OpenAI compatible)
   - POST /v1/rerank      (Jina/Cohere style)
+  - POST /v1/files       (OpenAI Files API)
+  - POST /v1/batches     (OpenAI Batch API)
 """
 
 import os
 import sys
 import time
-from typing import List, Optional, Union
+import uuid
+import json
+import asyncio
+import tempfile
+from datetime import datetime
+from typing import List, Optional, Union, Dict, Any
 from contextlib import asynccontextmanager
 import platform
 
 import torch
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
@@ -83,6 +91,10 @@ def check_cpu_capabilities():
 # Global model references
 embedding_model = None
 reranker_model = None
+
+# In-memory storage for Files and Batches
+files_storage: Dict[str, Dict[str, Any]] = {}  # file_id -> file metadata + content
+batches_storage: Dict[str, Dict[str, Any]] = {}  # batch_id -> batch metadata
 
 
 # =============================================================================
@@ -224,6 +236,73 @@ class RerankResponse(BaseModel):
     model: str
     results: List[RerankResult]
     usage: dict
+
+
+# =============================================================================
+# File & Batch Models (OpenAI Batch API)
+# =============================================================================
+
+
+class FileObject(BaseModel):
+    """OpenAI File object."""
+
+    id: str
+    object: str = "file"
+    bytes: int
+    created_at: int
+    filename: str
+    purpose: str
+    status: str = "uploaded"
+
+
+class FileListResponse(BaseModel):
+    """List of files."""
+
+    object: str = "list"
+    data: List[FileObject]
+
+
+class BatchRequest(BaseModel):
+    """Batch creation request."""
+
+    input_file_id: str
+    endpoint: str = "/v1/embeddings"
+    completion_window: str = "24h"
+    metadata: Optional[Dict[str, str]] = None
+
+
+class BatchObject(BaseModel):
+    """OpenAI Batch object."""
+
+    id: str
+    object: str = "batch"
+    endpoint: str
+    errors: Optional[Dict[str, Any]] = None
+    input_file_id: str
+    completion_window: str
+    status: str
+    output_file_id: Optional[str] = None
+    error_file_id: Optional[str] = None
+    created_at: int
+    in_progress_at: Optional[int] = None
+    expires_at: Optional[int] = None
+    finalizing_at: Optional[int] = None
+    completed_at: Optional[int] = None
+    failed_at: Optional[int] = None
+    expired_at: Optional[int] = None
+    cancelling_at: Optional[int] = None
+    cancelled_at: Optional[int] = None
+    request_counts: Dict[str, int] = Field(
+        default_factory=lambda: {"total": 0, "completed": 0, "failed": 0}
+    )
+    metadata: Optional[Dict[str, str]] = None
+
+
+class BatchListResponse(BaseModel):
+    """List of batches."""
+
+    object: str = "list"
+    data: List[BatchObject]
 
 
 # =============================================================================
@@ -390,6 +469,415 @@ async def rerank(request: RerankRequest):
 
 
 # =============================================================================
+# File Endpoints (OpenAI Files API)
+# =============================================================================
+
+
+@app.post("/v1/files", response_model=FileObject)
+async def upload_file(file: UploadFile = File(...), purpose: str = "batch"):
+    """
+    Upload a file for batch processing.
+    Expects JSONL format with one request per line.
+    """
+    if purpose != "batch":
+        raise HTTPException(status_code=400, detail="Only 'batch' purpose is supported")
+
+    # Read file content
+    content = await file.read()
+
+    # Generate file ID
+    file_id = f"file-{uuid.uuid4().hex[:24]}"
+    created_at = int(time.time())
+
+    # Store file
+    files_storage[file_id] = {
+        "id": file_id,
+        "bytes": len(content),
+        "created_at": created_at,
+        "filename": file.filename or "batch.jsonl",
+        "purpose": purpose,
+        "status": "uploaded",
+        "content": content,
+    }
+
+    print(f"  [INFO] Uploaded file {file_id}: {file.filename} ({len(content)} bytes)")
+
+    return FileObject(
+        id=file_id,
+        bytes=len(content),
+        created_at=created_at,
+        filename=file.filename or "batch.jsonl",
+        purpose=purpose,
+        status="uploaded",
+    )
+
+
+@app.get("/v1/files", response_model=FileListResponse)
+async def list_files(purpose: str = "batch"):
+    """List all uploaded files."""
+    files = []
+    for file_id, file_data in files_storage.items():
+        if purpose and file_data.get("purpose") != purpose:
+            continue
+        files.append(
+            FileObject(
+                id=file_data["id"],
+                bytes=file_data["bytes"],
+                created_at=file_data["created_at"],
+                filename=file_data["filename"],
+                purpose=file_data["purpose"],
+                status=file_data.get("status", "uploaded"),
+            )
+        )
+    return FileListResponse(object="list", data=files)
+
+
+@app.get("/v1/files/{file_id}", response_model=FileObject)
+async def get_file(file_id: str):
+    """Get file metadata."""
+    if file_id not in files_storage:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    file_data = files_storage[file_id]
+    return FileObject(
+        id=file_data["id"],
+        bytes=file_data["bytes"],
+        created_at=file_data["created_at"],
+        filename=file_data["filename"],
+        purpose=file_data["purpose"],
+        status=file_data.get("status", "uploaded"),
+    )
+
+
+@app.delete("/v1/files/{file_id}")
+async def delete_file(file_id: str):
+    """Delete a file."""
+    if file_id not in files_storage:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    del files_storage[file_id]
+    print(f"  [INFO] Deleted file {file_id}")
+    return {"id": file_id, "object": "file", "deleted": True}
+
+
+@app.get("/v1/files/{file_id}/content")
+async def get_file_content(file_id: str):
+    """Get file content (for output files)."""
+    if file_id not in files_storage:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    file_data = files_storage[file_id]
+    content = file_data.get("content", b"")
+    return Response(
+        content=content,
+        media_type="application/jsonl",
+        headers={
+            "Content-Disposition": f'attachment; filename="{file_data["filename"]}"'
+        },
+    )
+
+
+# =============================================================================
+# Batch Processing Logic
+# =============================================================================
+
+
+async def process_batch_job(batch_id: str):
+    """Background task to process a batch job."""
+    global embedding_model
+
+    if batch_id not in batches_storage:
+        return
+
+    batch = batches_storage[batch_id]
+    input_file_id = batch["input_file_id"]
+
+    if input_file_id not in files_storage:
+        batch["status"] = "failed"
+        batch["failed_at"] = int(time.time())
+        batch["errors"] = {"message": "Input file not found"}
+        return
+
+    # Update status to in_progress
+    batch["status"] = "in_progress"
+    batch["in_progress_at"] = int(time.time())
+    print(f"  [BATCH] Starting batch {batch_id}")
+
+    try:
+        # Read input file
+        input_content = files_storage[input_file_id]["content"].decode("utf-8")
+        lines = [
+            line.strip() for line in input_content.strip().split("\n") if line.strip()
+        ]
+
+        results = []
+        total_requests = len(lines)
+        completed = 0
+        failed = 0
+
+        # Process each request
+        for i, line in enumerate(lines):
+            try:
+                request_data = json.loads(line)
+                custom_id = request_data.get("custom_id", f"request-{i}")
+                body = request_data.get("body", {})
+                method = request_data.get("method", "POST")
+
+                # Process based on endpoint
+                if (
+                    request_data.get("endpoint") == "/v1/embeddings"
+                    or batch["endpoint"] == "/v1/embeddings"
+                ):
+                    # Extract input texts
+                    input_texts = body.get("input", [])
+                    if isinstance(input_texts, str):
+                        input_texts = [input_texts]
+
+                    if not input_texts or embedding_model is None:
+                        raise ValueError("No input texts or model not loaded")
+
+                    # Generate embeddings
+                    batch_size = body.get("batch_size", 32)
+                    embeddings = embedding_model.encode(
+                        input_texts,
+                        normalize_embeddings=True,
+                        batch_size=batch_size,
+                        convert_to_numpy=True,
+                    )
+
+                    # Build response
+                    response_data = []
+                    total_tokens = 0
+                    for idx, emb in enumerate(embeddings):
+                        response_data.append(
+                            {
+                                "object": "embedding",
+                                "index": idx,
+                                "embedding": emb.tolist(),
+                            }
+                        )
+                        total_tokens += len(input_texts[idx].split()) * 2
+
+                    response = {
+                        "status_code": 200,
+                        "body": {
+                            "object": "list",
+                            "data": response_data,
+                            "model": body.get(
+                                "model", "jina-embeddings-v5-text-small-retrieval"
+                            ),
+                            "usage": {
+                                "prompt_tokens": total_tokens,
+                                "total_tokens": total_tokens,
+                            },
+                        },
+                    }
+                    completed += 1
+                else:
+                    raise ValueError(
+                        f"Unsupported endpoint: {request_data.get('endpoint')}"
+                    )
+
+                results.append(
+                    {
+                        "id": f"resp-{uuid.uuid4().hex[:24]}",
+                        "custom_id": custom_id,
+                        "response": response,
+                        "error": None,
+                    }
+                )
+
+            except Exception as e:
+                failed += 1
+                results.append(
+                    {
+                        "id": f"resp-{uuid.uuid4().hex[:24]}",
+                        "custom_id": request_data.get("custom_id", f"request-{i}")
+                        if "request_data" in dir()
+                        else f"request-{i}",
+                        "response": None,
+                        "error": {"message": str(e), "type": "processing_error"},
+                    }
+                )
+
+            # Update progress
+            batch["request_counts"] = {
+                "total": total_requests,
+                "completed": completed,
+                "failed": failed,
+            }
+
+        # Create output file
+        output_content = "\n".join(json.dumps(r) for r in results)
+        output_file_id = f"file-{uuid.uuid4().hex[:24]}"
+        files_storage[output_file_id] = {
+            "id": output_file_id,
+            "bytes": len(output_content.encode("utf-8")),
+            "created_at": int(time.time()),
+            "filename": f"batch_{batch_id}_output.jsonl",
+            "purpose": "batch_output",
+            "status": "uploaded",
+            "content": output_content.encode("utf-8"),
+        }
+
+        # Update batch status
+        batch["status"] = "completed"
+        batch["completed_at"] = int(time.time())
+        batch["output_file_id"] = output_file_id
+        batch["request_counts"] = {
+            "total": total_requests,
+            "completed": completed,
+            "failed": failed,
+        }
+
+        print(
+            f"  [BATCH] Completed batch {batch_id}: {completed}/{total_requests} succeeded, {failed} failed"
+        )
+
+    except Exception as e:
+        batch["status"] = "failed"
+        batch["failed_at"] = int(time.time())
+        batch["errors"] = {"message": str(e)}
+        print(f"  [BATCH] Failed batch {batch_id}: {e}")
+
+
+# =============================================================================
+# Batch Endpoints (OpenAI Batch API)
+# =============================================================================
+
+
+@app.post("/v1/batches", response_model=BatchObject)
+async def create_batch(request: BatchRequest, background_tasks: BackgroundTasks):
+    """Create a new batch job."""
+    if request.input_file_id not in files_storage:
+        raise HTTPException(status_code=404, detail="Input file not found")
+
+    if request.endpoint != "/v1/embeddings":
+        raise HTTPException(
+            status_code=400, detail="Only /v1/embeddings endpoint is supported"
+        )
+
+    # Generate batch ID
+    batch_id = f"batch_{uuid.uuid4().hex[:24]}"
+    created_at = int(time.time())
+
+    # Create batch
+    batch = {
+        "id": batch_id,
+        "endpoint": request.endpoint,
+        "input_file_id": request.input_file_id,
+        "completion_window": request.completion_window,
+        "status": "validating",
+        "created_at": created_at,
+        "metadata": request.metadata,
+        "request_counts": {"total": 0, "completed": 0, "failed": 0},
+    }
+    batches_storage[batch_id] = batch
+
+    print(f"  [BATCH] Created batch {batch_id} with input file {request.input_file_id}")
+
+    # Start background processing
+    background_tasks.add_task(process_batch_job, batch_id)
+
+    return BatchObject(
+        id=batch_id,
+        endpoint=request.endpoint,
+        input_file_id=request.input_file_id,
+        completion_window=request.completion_window,
+        status="validating",
+        created_at=created_at,
+        metadata=request.metadata,
+    )
+
+
+@app.get("/v1/batches", response_model=BatchListResponse)
+async def list_batches(limit: int = 20):
+    """List all batch jobs."""
+    batches = []
+    for batch_id, batch_data in batches_storage.items():
+        batches.append(
+            BatchObject(
+                id=batch_data["id"],
+                endpoint=batch_data["endpoint"],
+                input_file_id=batch_data["input_file_id"],
+                completion_window=batch_data["completion_window"],
+                status=batch_data["status"],
+                created_at=batch_data["created_at"],
+                in_progress_at=batch_data.get("in_progress_at"),
+                completed_at=batch_data.get("completed_at"),
+                failed_at=batch_data.get("failed_at"),
+                output_file_id=batch_data.get("output_file_id"),
+                errors=batch_data.get("errors"),
+                request_counts=batch_data.get(
+                    "request_counts", {"total": 0, "completed": 0, "failed": 0}
+                ),
+                metadata=batch_data.get("metadata"),
+            )
+        )
+    return BatchListResponse(object="list", data=batches[:limit])
+
+
+@app.get("/v1/batches/{batch_id}", response_model=BatchObject)
+async def get_batch(batch_id: str):
+    """Get batch job status."""
+    if batch_id not in batches_storage:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    batch = batches_storage[batch_id]
+    return BatchObject(
+        id=batch["id"],
+        endpoint=batch["endpoint"],
+        input_file_id=batch["input_file_id"],
+        completion_window=batch["completion_window"],
+        status=batch["status"],
+        created_at=batch["created_at"],
+        in_progress_at=batch.get("in_progress_at"),
+        completed_at=batch.get("completed_at"),
+        failed_at=batch.get("failed_at"),
+        output_file_id=batch.get("output_file_id"),
+        errors=batch.get("errors"),
+        request_counts=batch.get(
+            "request_counts", {"total": 0, "completed": 0, "failed": 0}
+        ),
+        metadata=batch.get("metadata"),
+    )
+
+
+@app.post("/v1/batches/{batch_id}/cancel", response_model=BatchObject)
+async def cancel_batch(batch_id: str):
+    """Cancel a batch job."""
+    if batch_id not in batches_storage:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    batch = batches_storage[batch_id]
+
+    if batch["status"] in ["completed", "failed", "cancelled", "expired"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot cancel batch with status: {batch['status']}",
+        )
+
+    batch["status"] = "cancelled"
+    batch["cancelled_at"] = int(time.time())
+
+    print(f"  [BATCH] Cancelled batch {batch_id}")
+
+    return BatchObject(
+        id=batch["id"],
+        endpoint=batch["endpoint"],
+        input_file_id=batch["input_file_id"],
+        completion_window=batch["completion_window"],
+        status=batch["status"],
+        created_at=batch["created_at"],
+        cancelled_at=batch.get("cancelled_at"),
+        request_counts=batch.get(
+            "request_counts", {"total": 0, "completed": 0, "failed": 0}
+        ),
+        metadata=batch.get("metadata"),
+    )
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -399,15 +887,22 @@ if __name__ == "__main__":
     print("""
     ============================================================
          Jina Embedding & Reranker Server
-    ===========================================================
+    ============================================================
       Endpoints:
          POST /v1/embeddings  - Create embeddings
          POST /v1/rerank      - Rerank documents
+         POST /v1/files       - Upload batch file
+         GET  /v1/files       - List files
+         GET  /v1/files/{id}  - Get file info
+         GET  /v1/files/{id}/content - Download file
+         POST /v1/batches     - Create batch job
+         GET  /v1/batches     - List batches
+         GET  /v1/batches/{id}- Get batch status
          GET  /v1/models      - List models
-         GET  /                - Health check
-    ===========================================================
+         GET  /               - Health check
+    ============================================================
       Server running on http://0.0.0.0:8000
-    ===========================================================
+    ============================================================
     """)
 
     uvicorn.run(
