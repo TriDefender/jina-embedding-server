@@ -1,0 +1,9 @@
+[
+    {
+        "idx": 0,
+        "name": "transformer",
+        "path": "",
+        "type": "custom_st.Transformer",
+        "kwargs": ["task", "truncate_dim"]
+    }
+]

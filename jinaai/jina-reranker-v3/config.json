@@ -1,0 +1,32 @@
+{
+  "_name_or_path": "jinaai/jina-reranker-v3",
+  "architectures": ["JinaForRanking"],
+  "auto_map": {
+    "AutoModel": "modeling.JinaForRanking"
+  },
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": 151643,
+  "eos_token_id": 151645,
+  "head_dim": 128,
+  "hidden_act": "silu",
+  "hidden_size": 1024,
+  "initializer_range": 0.02,
+  "intermediate_size": 3072,
+  "max_position_embeddings": 131072,
+  "max_window_layers": 28,
+  "model_type": "qwen3",
+  "num_attention_heads": 16,
+  "num_hidden_layers": 28,
+  "num_key_value_heads": 8,
+  "rms_norm_eps": 1e-6,
+  "rope_scaling": null,
+  "rope_theta": 1000000,
+  "sliding_window": null,
+  "tie_word_embeddings": true,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.55.2",
+  "use_cache": false,
+  "use_sliding_window": false,
+  "vocab_size": 151936
+}
