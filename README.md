@@ -19,7 +19,7 @@ uv sync
 Start the server:
 
 ```bash
-uv run python jina_server.py
+uv run jina_server.py
 ```
 
 Or activate the virtual environment:
