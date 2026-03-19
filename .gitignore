@@ -19,9 +19,7 @@ env/
 *.swo
 
 # Models (too large)
-*.safetensors
-*.onnx_data
-*.onnx
+jina/
 *.gguf
 *.fdmdownload
 .locks/
