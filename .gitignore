@@ -19,7 +19,7 @@ env/
 *.swo
 
 # Models (too large)
-jina/
+jinaai/
 *.gguf
 *.fdmdownload
 .locks/
