@@ -12,6 +12,8 @@ OpenAI-compatible API server for Jina embeddings and reranking models.
 
 ```bash
 uv sync
+
+Fetch_Models.bat  #This is for windows, it contains two 'hf download' commands, adapt for linux accordingly
 ```
 
 ## Usage
