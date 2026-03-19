@@ -26,7 +26,7 @@ from transformers import AutoTokenizer
 # Configuration
 # =============================================================================
 
-MODELS_DIR = r"D:\AI Models\embeddings\jinaai"
+MODELS_DIR = r".\jinaai"
 
 EMBEDDING_MODEL_PATH = os.path.join(
     MODELS_DIR, "jina-embeddings-v5-text-small-retrieval"
