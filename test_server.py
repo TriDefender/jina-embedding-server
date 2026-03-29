@@ -48,7 +48,9 @@ def test_embeddings():
 
     data = {
         "input": test_texts,
-        "model": "jina-embeddings-v5-text-small-retrieval",
+        "model": "jina-embeddings-v5-text-small",
+        "task": "retrieval",
+        "prompt_name": "query",
         "batch_size": 32,
     }
 
@@ -116,6 +118,62 @@ def test_rerank():
         print(f"Error: {resp.text}")
 
 
+def test_task_parameter():
+    """Test task and prompt_name parameters."""
+    print("\n" + "=" * 50)
+    print("Testing task parameter...")
+
+    # Test retrieval with query
+    data = {
+        "input": "What is machine learning?",
+        "task": "retrieval",
+        "prompt_name": "query",
+    }
+    resp = requests.post(f"{BASE_URL}/v1/embeddings", json=data)
+    print(
+        f"[retrieval+query] Status: {resp.status_code}, Embedding dim: {len(resp.json()['data'][0]['embedding'])}"
+    )
+
+    # Test retrieval with document
+    data["prompt_name"] = "document"
+    resp = requests.post(f"{BASE_URL}/v1/embeddings", json=data)
+    print(
+        f"[retrieval+document] Status: {resp.status_code}, Embedding dim: {len(resp.json()['data'][0]['embedding'])}"
+    )
+
+    # Test text-matching (no prompt_name needed)
+    data = {"input": "Hello world", "task": "text-matching"}
+    resp = requests.post(f"{BASE_URL}/v1/embeddings", json=data)
+    print(
+        f"[text-matching] Status: {resp.status_code}, Embedding dim: {len(resp.json()['data'][0]['embedding'])}"
+    )
+
+    # Test classification
+    data = {"input": "This is great", "task": "classification"}
+    resp = requests.post(f"{BASE_URL}/v1/embeddings", json=data)
+    print(
+        f"[classification] Status: {resp.status_code}, Embedding dim: {len(resp.json()['data'][0]['embedding'])}"
+    )
+
+    # Test clustering
+    data = {"input": "Neural networks for image recognition", "task": "clustering"}
+    resp = requests.post(f"{BASE_URL}/v1/embeddings", json=data)
+    print(
+        f"[clustering] Status: {resp.status_code}, Embedding dim: {len(resp.json()['data'][0]['embedding'])}"
+    )
+
+
+def test_invalid_task():
+    """Test that invalid task returns 422."""
+    print("\n" + "=" * 50)
+    print("Testing invalid task validation...")
+
+    data = {"input": "Hello", "task": "invalid-task"}
+    resp = requests.post(f"{BASE_URL}/v1/embeddings", json=data)
+    assert resp.status_code == 422, f"Expected 422, got {resp.status_code}"
+    print(f"Invalid task correctly rejected: {resp.status_code}")
+
+
 # =============================================================================
 # Batch API Tests
 # =============================================================================
@@ -134,7 +192,7 @@ def test_file_upload():
             "url": "/v1/embeddings",
             "body": {
                 "input": f"Test text number {i} for batch processing",
-                "model": "jina-embeddings-v5-text-small-retrieval",
+                "model": "jina-embeddings-v5-text-small",
             },
         }
         for i in range(5)
@@ -393,6 +451,8 @@ if __name__ == "__main__":
         test_health()
         test_models()
         test_embeddings()
+        test_task_parameter()
+        test_invalid_task()
         test_rerank()
         test_batch_api()  # New batch API test
 

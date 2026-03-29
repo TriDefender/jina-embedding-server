@@ -25,7 +25,7 @@ import torch
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 
@@ -36,10 +36,14 @@ from transformers import AutoTokenizer
 
 MODELS_DIR = r".\jinaai"
 
-EMBEDDING_MODEL_PATH = os.path.join(
-    MODELS_DIR, "jina-embeddings-v5-text-small-retrieval"
-)
+EMBEDDING_MODEL_PATH = os.path.join(MODELS_DIR, "jina-embeddings-v5-text-small")
 RERANKER_MODEL_PATH = os.path.join(MODELS_DIR, "jina-reranker-v3")
+
+# Valid task types for jina-embeddings-v5-text-small (LoRA task adapters)
+# See: https://huggingface.co/jinaai/jina-embeddings-v5-text-small
+VALID_EMBEDDING_TASKS = ("retrieval", "text-matching", "clustering", "classification")
+# For retrieval task, prompt_name selects query vs document prefix
+VALID_PROMPT_NAMES = ("query", "document")
 
 # CPU configuration
 MAX_THREADS = 20  # Limit to 20 cores as requested
@@ -183,11 +187,43 @@ class EmbeddingRequest(BaseModel):
     """OpenAI-compatible embedding request."""
 
     input: Union[str, List[str]] = Field(..., description="Text to embed")
-    model: str = Field(default="jina-embeddings-v5-text-small-retrieval")
+    model: str = Field(default="jina-embeddings-v5-text-small")
     encoding_format: str = Field(default="float", description="float or base64")
     batch_size: int = Field(
         default=32, ge=1, le=128, description="Batch size for processing"
     )
+    task: str = Field(
+        default="retrieval",
+        description="Task adapter: retrieval, text-matching, clustering, classification",
+    )
+    prompt_name: Optional[str] = Field(
+        default=None,
+        description="For retrieval task only: 'query' or 'document'. Required when task='retrieval'.",
+    )
+
+    @field_validator("task")
+    @classmethod
+    def validate_task(cls, v: str) -> str:
+        if v not in VALID_EMBEDDING_TASKS:
+            raise ValueError(
+                f"Invalid task '{v}'. Must be one of: {VALID_EMBEDDING_TASKS}"
+            )
+        return v
+
+    @field_validator("prompt_name")
+    @classmethod
+    def validate_prompt_name(cls, v: Optional[str], info) -> Optional[str]:
+        if v is not None and v not in VALID_PROMPT_NAMES:
+            raise ValueError(
+                f"Invalid prompt_name '{v}'. Must be one of: {VALID_PROMPT_NAMES}"
+            )
+        # Retrieval task requires prompt_name to distinguish query vs document
+        task = info.data.get("task")
+        if task == "retrieval" and v is None:
+            raise ValueError(
+                "prompt_name is required when task='retrieval'. Use 'query' or 'document'."
+            )
+        return v
 
 
 class EmbeddingObject(BaseModel):
@@ -329,7 +365,7 @@ async def list_models():
         "object": "list",
         "data": [
             {
-                "id": "jina-embeddings-v5-text-small-retrieval",
+                "id": "jina-embeddings-v5-text-small",
                 "object": "model",
                 "owned_by": "jina-ai",
             },
@@ -362,13 +398,21 @@ async def create_embeddings(request: EmbeddingRequest):
     batch_size = request.batch_size
     all_embeddings = []
 
+    # Build encode kwargs based on task and prompt_name
+    encode_kwargs = {
+        "task": request.task,
+        "normalize_embeddings": True,
+        "batch_size": batch_size,
+        "convert_to_numpy": True,
+    }
+    if request.prompt_name is not None:
+        encode_kwargs["prompt_name"] = request.prompt_name
+
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i : i + batch_size]
         batch_embeddings = embedding_model.encode(
             batch_texts,
-            normalize_embeddings=True,
-            batch_size=batch_size,
-            convert_to_numpy=True,
+            **encode_kwargs,
         )
         all_embeddings.extend(batch_embeddings)
 
@@ -636,13 +680,34 @@ async def process_batch_job(batch_id: str):
                     if not input_texts or embedding_model is None:
                         raise ValueError("No input texts or model not loaded")
 
-                    # Generate embeddings
+                    # Extract and validate task/prompt_name
                     batch_size = body.get("batch_size", 32)
+                    task = body.get("task", "retrieval")
+                    if task not in VALID_EMBEDDING_TASKS:
+                        raise ValueError(
+                            f"Invalid task '{task}'. Must be one of: {VALID_EMBEDDING_TASKS}"
+                        )
+                    prompt_name = body.get("prompt_name", None)
+                    if (
+                        prompt_name is not None
+                        and prompt_name not in VALID_PROMPT_NAMES
+                    ):
+                        raise ValueError(
+                            f"Invalid prompt_name '{prompt_name}'. Must be one of: {VALID_PROMPT_NAMES}"
+                        )
+
+                    # Generate embeddings
+                    encode_kwargs = {
+                        "task": task,
+                        "normalize_embeddings": True,
+                        "batch_size": batch_size,
+                        "convert_to_numpy": True,
+                    }
+                    if prompt_name is not None:
+                        encode_kwargs["prompt_name"] = prompt_name
                     embeddings = embedding_model.encode(
                         input_texts,
-                        normalize_embeddings=True,
-                        batch_size=batch_size,
-                        convert_to_numpy=True,
+                        **encode_kwargs,
                     )
 
                     # Build response
@@ -663,9 +728,7 @@ async def process_batch_job(batch_id: str):
                         "body": {
                             "object": "list",
                             "data": response_data,
-                            "model": body.get(
-                                "model", "jina-embeddings-v5-text-small-retrieval"
-                            ),
+                            "model": body.get("model", "jina-embeddings-v5-text-small"),
                             "usage": {
                                 "prompt_tokens": total_tokens,
                                 "total_tokens": total_tokens,

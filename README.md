@@ -4,9 +4,10 @@ OpenAI-compatible API server for Jina embeddings and reranking models.
 
 ## Features
 
-- **Embedding**: jina-embeddings-v5-text-small-retrieval
+- **Embedding**: jina-embeddings-v5-text-small (with LoRA task adapters)
 - **Reranking**: jina-reranker-v3
 - **OpenAI-compatible API**: Works with existing OpenAI client libraries
+- **Task-adaptive embeddings**: Switch LoRA adapter per request (`retrieval`, `text-matching`, `clustering`, `classification`)
 
 ## Installation
 
@@ -36,12 +37,58 @@ python jina_server.py
 
 ### `POST /v1/embeddings`
 
-Create embeddings for input text.
+Create embeddings for input text. Supports task-adaptive LoRA adapters.
+
+#### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `input` | `string \| string[]` | *(required)* | Text(s) to embed |
+| `task` | `string` | `"retrieval"` | Task adapter: `retrieval`, `text-matching`, `clustering`, `classification` |
+| `prompt_name` | `string` | `null` | Required when `task="retrieval"`: `"query"` or `"document"` |
+| `model` | `string` | `"jina-embeddings-v5-text-small"` | Model name |
+| `batch_size` | `int` | `32` | Processing batch size (1–128) |
+
+#### Examples
+
+Retrieval (query side):
 
 ```bash
 curl http://localhost:8000/v1/embeddings \
   -H "Content-Type: application/json" \
-  -d '{"input": "Hello, world!"}'
+  -d '{"input": "What is machine learning?", "task": "retrieval", "prompt_name": "query"}'
+```
+
+Retrieval (document side):
+
+```bash
+curl http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Machine learning is a field of AI...", "task": "retrieval", "prompt_name": "document"}'
+```
+
+Text matching:
+
+```bash
+curl http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input": ["Hello", "Hi"], "task": "text-matching"}'
+```
+
+Classification:
+
+```bash
+curl http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input": "This product is great!", "task": "classification"}'
+```
+
+Clustering:
+
+```bash
+curl http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input": ["neural networks", "monetary policy"], "task": "clustering"}'
 ```
 
 ### `POST /v1/rerank`
