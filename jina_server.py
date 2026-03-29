@@ -25,7 +25,7 @@ import torch
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 
@@ -44,6 +44,15 @@ RERANKER_MODEL_PATH = os.path.join(MODELS_DIR, "jina-reranker-v3")
 VALID_EMBEDDING_TASKS = ("retrieval", "text-matching", "clustering", "classification")
 # For retrieval task, prompt_name selects query vs document prefix
 VALID_PROMPT_NAMES = ("query", "document")
+# Jina cloud API sends dot-notation tasks; map them to (task, prompt_name)
+TASK_ALIAS_MAP = {
+    "retrieval.query": ("retrieval", "query"),
+    "retrieval.passage": ("retrieval", "document"),
+    "text-matching": ("text-matching", None),
+    "classification": ("classification", None),
+    "clustering": ("clustering", None),
+    "separation": ("text-matching", None),
+}
 
 # CPU configuration
 MAX_THREADS = 20  # Limit to 20 cores as requested
@@ -204,9 +213,11 @@ class EmbeddingRequest(BaseModel):
     @field_validator("task")
     @classmethod
     def validate_task(cls, v: str) -> str:
-        if v not in VALID_EMBEDDING_TASKS:
+        # Accept both plain tasks ("retrieval") and Jina cloud aliases ("retrieval.query")
+        # Aliases are resolved after validation — see model_validator below
+        if v not in VALID_EMBEDDING_TASKS and v not in TASK_ALIAS_MAP:
             raise ValueError(
-                f"Invalid task '{v}'. Must be one of: {VALID_EMBEDDING_TASKS}"
+                f"Invalid task '{v}'. Must be one of: {VALID_EMBEDDING_TASKS} or aliases: {list(TASK_ALIAS_MAP.keys())}"
             )
         return v
 
@@ -217,13 +228,22 @@ class EmbeddingRequest(BaseModel):
             raise ValueError(
                 f"Invalid prompt_name '{v}'. Must be one of: {VALID_PROMPT_NAMES}"
             )
-        # Retrieval task requires prompt_name to distinguish query vs document
-        task = info.data.get("task")
-        if task == "retrieval" and v is None:
+        return v
+
+    @model_validator(mode="after")
+    def resolve_task_alias(self) -> "EmbeddingRequest":
+        """Expand dot-notation task aliases (e.g. 'retrieval.query') into task + prompt_name."""
+        if self.task in TASK_ALIAS_MAP:
+            resolved_task, resolved_prompt = TASK_ALIAS_MAP[self.task]
+            object.__setattr__(self, "task", resolved_task)
+            if self.prompt_name is None:
+                object.__setattr__(self, "prompt_name", resolved_prompt)
+        # Retrieval task requires prompt_name
+        if self.task == "retrieval" and self.prompt_name is None:
             raise ValueError(
                 "prompt_name is required when task='retrieval'. Use 'query' or 'document'."
             )
-        return v
+        return self
 
 
 class EmbeddingObject(BaseModel):
@@ -683,11 +703,14 @@ async def process_batch_job(batch_id: str):
                     # Extract and validate task/prompt_name
                     batch_size = body.get("batch_size", 32)
                     task = body.get("task", "retrieval")
+                    prompt_name = body.get("prompt_name", None)
+                    # Resolve dot-notation aliases (e.g. "retrieval.query")
+                    if task in TASK_ALIAS_MAP:
+                        task, prompt_name = TASK_ALIAS_MAP[task]
                     if task not in VALID_EMBEDDING_TASKS:
                         raise ValueError(
                             f"Invalid task '{task}'. Must be one of: {VALID_EMBEDDING_TASKS}"
                         )
-                    prompt_name = body.get("prompt_name", None)
                     if (
                         prompt_name is not None
                         and prompt_name not in VALID_PROMPT_NAMES
