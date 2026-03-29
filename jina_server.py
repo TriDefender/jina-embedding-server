@@ -206,7 +206,7 @@ class EmbeddingRequest(BaseModel):
         description="Task adapter: retrieval, text-matching, clustering, classification",
     )
     prompt_name: Optional[str] = Field(
-        default=None,
+        default="query",
         description="For retrieval task only: 'query' or 'document'. Required when task='retrieval'.",
     )
 
