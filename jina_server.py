@@ -701,6 +701,7 @@ async def process_batch_job(batch_id: str):
         parse_errors: List[tuple] = []  # (index, custom_id, error_msg)
 
         for i, line in enumerate(lines):
+            custom_id = f"request-{i}"
             try:
                 request_data = json.loads(line)
                 custom_id = request_data.get("custom_id", f"request-{i}")
@@ -748,7 +749,7 @@ async def process_batch_job(batch_id: str):
                 )
 
             except Exception as e:
-                parse_errors.append((i, f"request-{i}", str(e)))
+                parse_errors.append((i, custom_id, str(e)))
 
         # ---- Phase 2: Batch-encode per (task, prompt_name) group ----
         # Maps: line_index -> list[np.ndarray] (embeddings for that line)
