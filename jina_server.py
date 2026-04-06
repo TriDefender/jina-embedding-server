@@ -9,6 +9,7 @@ Endpoints:
   - POST /v1/batches     (OpenAI Batch API)
 """
 
+import asyncio
 import os
 import sys
 import time
@@ -19,7 +20,22 @@ from typing import List, Optional, Union, Dict, Any
 from contextlib import asynccontextmanager
 import platform
 
+# =============================================================================
+# Thread configuration — MUST be set before torch import
+# =============================================================================
+# Tuned for AMD R9 9900X (12C/24T, Zen 5)
+# Use physical cores only; SMT yields negligible gains for dense matmul
+MAX_THREADS = 12
+os.environ["OMP_NUM_THREADS"] = str(MAX_THREADS)
+os.environ["MKL_NUM_THREADS"] = str(MAX_THREADS)
+os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_THREADS)
+os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
+os.environ["TORCH_INTEROP_THREADS"] = "4"
+
 import torch
+
+torch.set_num_threads(MAX_THREADS)
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -49,14 +65,6 @@ TASK_ALIAS_MAP = {
     "clustering": ("clustering", None),
     "separation": ("text-matching", None),
 }
-
-# CPU configuration
-MAX_THREADS = 20  # Limit to 20 cores as requested
-torch.set_num_threads(MAX_THREADS)
-os.environ["OMP_NUM_THREADS"] = str(MAX_THREADS)
-os.environ["MKL_NUM_THREADS"] = str(MAX_THREADS)
-os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_THREADS)
-os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
 
 
 # Check CPU capabilities
@@ -106,6 +114,100 @@ reranker_lock = threading.Lock()  # Protects reranker_model._block_size mutation
 files_storage: Dict[str, Dict[str, Any]] = {}  # file_id -> file metadata + content
 batches_storage: Dict[str, Dict[str, Any]] = {}  # batch_id -> batch metadata
 
+# ---------------------------------------------------------------------------
+# Dynamic batching infrastructure for /v1/embeddings
+# ---------------------------------------------------------------------------
+BATCH_WINDOW_MS = 50  # How long to wait before firing a batch (ms)
+BATCH_MAX_SIZE = 64  # Max requests to accumulate before firing early
+
+
+class _PendingEmbedRequest:
+    """Holds a single request awaiting batch encoding."""
+
+    __slots__ = ("texts", "task", "prompt_name", "batch_size", "future")
+
+    def __init__(self, texts, task, prompt_name, batch_size, future):
+        self.texts = texts
+        self.task = task
+        self.prompt_name = prompt_name
+        self.batch_size = batch_size
+        self.future = future
+
+
+_pending_embeddings: list[_PendingEmbedRequest] = []
+_batch_flush_lock: asyncio.Lock | None = None
+_batch_timer_handle: asyncio.TimerHandle | None = None
+
+
+async def _flush_embedding_batch():
+    """Drain pending requests, group by (task, prompt_name), batch-encode."""
+    global _pending_embeddings
+    if not _pending_embeddings:
+        return
+    # Grab everything in the queue
+    batch = _pending_embeddings[:]
+    _pending_embeddings = []
+
+    # Group by (task, prompt_name)
+    groups: Dict[tuple, List[_PendingEmbedRequest]] = {}
+    for req in batch:
+        key = (req.task, req.prompt_name)
+        groups.setdefault(key, []).append(req)
+
+    for (task, prompt_name), reqs in groups.items():
+        try:
+            # Flatten texts, track which request they belong to
+            flat_texts: List[str] = []
+            spans: List[tuple] = []  # (req_index, start, end)
+            offset = 0
+            for idx, r in enumerate(reqs):
+                flat_texts.extend(r.texts)
+                spans.append((idx, offset, offset + len(r.texts)))
+                offset += len(r.texts)
+
+            max_bs = max(r.batch_size for r in reqs)
+            encode_kwargs = {
+                "task": task,
+                "normalize_embeddings": True,
+                "batch_size": max_bs,
+                "convert_to_numpy": False,
+            }
+            if prompt_name is not None:
+                encode_kwargs["prompt_name"] = prompt_name
+
+            all_embs = embedding_model.encode(flat_texts, **encode_kwargs)
+
+            # Distribute results back
+            for req_idx, start, end in spans:
+                reqs[req_idx].future.set_result(all_embs[start:end])
+        except Exception as e:
+            # If encoding fails, propagate to all requests in group
+            for r in reqs:
+                if not r.future.done():
+                    r.future.set_exception(e)
+
+
+def _schedule_batch_flush():
+    """Schedule a flush after BATCH_WINDOW_MS unless one is already pending."""
+    global _batch_timer_handle
+    loop = asyncio.get_running_loop()
+    if _batch_timer_handle is not None and not _batch_timer_handle.cancelled():
+        return  # Already scheduled
+    _batch_timer_handle = loop.call_later(
+        BATCH_WINDOW_MS / 1000.0,
+        lambda: loop.create_task(_safe_flush()),
+    )
+
+
+async def _safe_flush():
+    """Flush with lock to prevent concurrent flushes."""
+    global _batch_timer_handle
+    if _batch_flush_lock is None:
+        return
+    async with _batch_flush_lock:
+        _batch_timer_handle = None  # Allow next request to schedule new timer
+        await _flush_embedding_batch()
+
 
 # =============================================================================
 # Lifespan
@@ -115,7 +217,7 @@ batches_storage: Dict[str, Dict[str, Any]] = {}  # batch_id -> batch metadata
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load models on startup."""
-    global embedding_model, reranker_model
+    global embedding_model, reranker_model, _batch_flush_lock
 
     # Display CPU capabilities
     cpu_caps = check_cpu_capabilities()
@@ -142,6 +244,7 @@ async def lifespan(app: FastAPI):
         embedding_model = SentenceTransformer(
             EMBEDDING_MODEL_PATH,
             trust_remote_code=True,
+            model_kwargs={"default_task": "retrieval"},
         )
         print(
             f"      [OK] Embedding model loaded (dim={embedding_model.get_sentence_embedding_dimension()})"
@@ -149,6 +252,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"      [FAIL] Failed to load embedding model: {e}")
         raise
+
+    # Compile embedding model for optimized CPU inference
+    # Uses TorchInductor to fuse ops and generate AVX-512 kernels
+    print("\n[OPTIMIZE] torch.compile() on embedding model...")
+    try:
+        # Compile the whole SentenceTransformer — only the forward() graph gets optimized; tokenization and Python logic remain unchanged
+        embedding_model = torch.compile(embedding_model, dynamic=True)
+        print("      [OK] torch.compile() applied")
+    except Exception as e:
+        print(f"      [WARN] torch.compile() failed (falling back to eager): {e}")
 
     # Load reranker model
     print(f"\n[2/2] Loading reranker model from: {RERANKER_MODEL_PATH}")
@@ -166,9 +279,27 @@ async def lifespan(app: FastAPI):
         print(f"      [FAIL] Failed to load reranker model: {e}")
         raise
 
+    # Initialize dynamic batching lock (needs running event loop)
+    _batch_flush_lock = asyncio.Lock()
+
     print("\n" + "=" * 60)
     print("Server ready!")
     print("=" * 60)
+
+    # Warmup: pre-allocate memory and trigger JIT compilation
+    print("\n[WARMUP] Pre-warming models...")
+    _ = embedding_model.encode(
+        ["warmup text"],
+        task="retrieval",
+        prompt_name="query",
+        convert_to_numpy=False,
+        normalize_embeddings=True,
+    )
+    try:
+        _ = reranker_model.rerank("warmup query", ["warmup doc"], top_n=1)
+    except Exception:
+        pass
+    print("      [OK] Models pre-warmed")
 
     yield
 
@@ -179,7 +310,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Jina Embedding & Reranker Server",
     description="OpenAI-compatible API for embeddings + reranking",
-    version="1.0.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -399,7 +530,7 @@ async def list_models():
 async def create_embeddings(request: EmbeddingRequest):
     """
     Create embeddings for input text(s).
-    OpenAI-compatible endpoint.
+    OpenAI-compatible endpoint with dynamic batching.
     """
     if embedding_model is None:
         raise HTTPException(status_code=503, detail="Embedding model not loaded")
@@ -410,21 +541,42 @@ async def create_embeddings(request: EmbeddingRequest):
     if not texts:
         raise HTTPException(status_code=400, detail="Input cannot be empty")
 
-    # SentenceTransformer.encode() handles internal batching via batch_size param
     start_time = time.time()
-    batch_size = request.batch_size
 
-    # Build encode kwargs based on task and prompt_name
-    encode_kwargs = {
-        "task": request.task,
-        "normalize_embeddings": True,
-        "batch_size": batch_size,
-        "convert_to_numpy": True,
-    }
-    if request.prompt_name is not None:
-        encode_kwargs["prompt_name"] = request.prompt_name
+    # Submit to dynamic batch queue when available and request is small enough
+    if _batch_flush_lock is not None and len(texts) <= BATCH_MAX_SIZE:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
 
-    all_embeddings = embedding_model.encode(texts, **encode_kwargs)
+        _pending_embeddings.append(
+            _PendingEmbedRequest(
+                texts=texts,
+                task=request.task,
+                prompt_name=request.prompt_name,
+                batch_size=request.batch_size,
+                future=future,
+            )
+        )
+
+        # Flush immediately if we hit max batch size, otherwise schedule timer
+        if len(_pending_embeddings) >= BATCH_MAX_SIZE:
+            loop.create_task(_safe_flush())
+        else:
+            _schedule_batch_flush()
+
+        all_embeddings = await future
+    else:
+        # Fallback: encode directly (large single requests or before lifespan init)
+        encode_kwargs = {
+            "task": request.task,
+            "normalize_embeddings": True,
+            "batch_size": request.batch_size,
+            "convert_to_numpy": False,
+        }
+        if request.prompt_name is not None:
+            encode_kwargs["prompt_name"] = request.prompt_name
+        loop = asyncio.get_running_loop()
+        all_embeddings = embedding_model.encode(texts, **encode_kwargs)
 
     elapsed = time.time() - start_time
     print(
@@ -453,7 +605,7 @@ async def create_embeddings(request: EmbeddingRequest):
         usage={
             "prompt_tokens": total_tokens,
             "total_tokens": total_tokens,
-            "batch_size": batch_size,
+            "batch_size": request.batch_size,
         },
     )
 
@@ -752,7 +904,7 @@ async def process_batch_job(batch_id: str):
                 parse_errors.append((i, custom_id, str(e)))
 
         # ---- Phase 2: Batch-encode per (task, prompt_name) group ----
-        # Maps: line_index -> list[np.ndarray] (embeddings for that line)
+        # Maps: line_index -> list[torch.Tensor] (embeddings for that line)
         embeddings_by_line: Dict[int, list] = {}
 
         for (task, prompt_name), entries in task_groups.items():
@@ -769,7 +921,7 @@ async def process_batch_job(batch_id: str):
                 "task": task,
                 "normalize_embeddings": True,
                 "batch_size": default_batch_size,
-                "convert_to_numpy": True,
+                "convert_to_numpy": False,
             }
             if prompt_name is not None:
                 encode_kwargs["prompt_name"] = prompt_name
