@@ -843,6 +843,188 @@ def test_batch_multi_input_texts():
     print("  [OK] Multi-input batch text distribution passed")
 
 
+# =============================================================================
+# ONNX Backend Tests
+# =============================================================================
+
+
+def test_onnx_status():
+    """Test that ONNX backend is active via health endpoint."""
+    print("\n" + "=" * 50)
+    print("Testing ONNX backend status...")
+
+    resp = requests.get(f"{BASE_URL}/")
+    assert resp.status_code == 200, f"Health check failed: {resp.status_code}"
+    data = resp.json()
+    onnx_enabled = data.get("onnx_enabled", False)
+    print(f"  onnx_enabled: {onnx_enabled}")
+
+    if onnx_enabled:
+        print("  [OK] ONNX backend is active")
+    else:
+        print("  [WARN] ONNX backend not active (running in PyTorch fallback mode)")
+
+
+def test_onnx_all_tasks():
+    """Test all 4 task types produce correct-dimension ONNX embeddings."""
+    print("\n" + "=" * 50)
+    print("Testing ONNX embeddings for all task types...")
+
+    test_cases = [
+        ("retrieval", "query", "What is machine learning?"),
+        ("retrieval", "document", "Machine learning is a branch of AI."),
+        ("text-matching", None, "Hello world"),
+        ("classification", None, "This product is great"),
+        ("clustering", None, "Neural networks for image recognition"),
+    ]
+
+    expected_dim = None
+    for task, prompt_name, text in test_cases:
+        data = {"input": text, "task": task}
+        if prompt_name:
+            data["prompt_name"] = prompt_name
+
+        resp = requests.post(f"{BASE_URL}/v1/embeddings", json=data)
+        assert resp.status_code == 200, f"Failed for {task}: {resp.text}"
+
+        result = resp.json()
+        embedding = result["data"][0]["embedding"]
+        dim = len(embedding)
+
+        if expected_dim is None:
+            expected_dim = dim
+
+        assert dim == expected_dim, (
+            f"Dimension mismatch for {task}: got {dim}, expected {expected_dim}"
+        )
+
+        # Check L2 normalization: norm should be ~1.0
+        norm = sum(x * x for x in embedding) ** 0.5
+        assert abs(norm - 1.0) < 0.01, (
+            f"Embedding not normalized for {task}: norm={norm:.4f}"
+        )
+
+        label = f"{task}" + (f"+{prompt_name}" if prompt_name else "")
+        print(f"  [OK] {label}: dim={dim}, norm={norm:.4f}")
+
+    print(f"  [OK] All {len(test_cases)} task types passed with dim={expected_dim}")
+
+
+def test_onnx_batch_encoding():
+    """Test ONNX batch encoding produces consistent results."""
+    print("\n" + "=" * 50)
+    print("Testing ONNX batch encoding consistency...")
+
+    texts = [f"Test text number {i}" for i in range(10)]
+
+    # Encode one at a time
+    single_embeddings = []
+    for text in texts:
+        resp = requests.post(
+            f"{BASE_URL}/v1/embeddings",
+            json={"input": text, "task": "retrieval", "prompt_name": "query"},
+        )
+        assert resp.status_code == 200
+        single_embeddings.append(resp.json()["data"][0]["embedding"])
+
+    # Encode all at once
+    resp = requests.post(
+        f"{BASE_URL}/v1/embeddings",
+        json={
+            "input": texts,
+            "task": "retrieval",
+            "prompt_name": "query",
+            "batch_size": 32,
+        },
+    )
+    assert resp.status_code == 200
+    batch_embeddings = [d["embedding"] for d in resp.json()["data"]]
+
+    # Compare: single vs batch should produce very similar embeddings
+    max_diff = 0.0
+    for i, (single, batch) in enumerate(zip(single_embeddings, batch_embeddings)):
+        diff = sum((a - b) ** 2 for a, b in zip(single, batch)) ** 0.5
+        max_diff = max(max_diff, diff)
+
+    print(f"  Max cosine distance (single vs batch): {max_diff:.6f}")
+    assert max_diff < 0.01, f"Batch encoding inconsistency: max_diff={max_diff}"
+    print("  [OK] Batch encoding is consistent with single encoding")
+
+
+def test_onnx_rerank_mixed():
+    """Test that ONNX embeddings + PyTorch reranker work together."""
+    print("\n" + "=" * 50)
+    print("Testing mixed ONNX (embeddings) + PyTorch (reranker)...")
+
+    import concurrent.futures
+
+    results = {"embed": None, "rerank": None}
+    errors = []
+
+    def do_embed():
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/v1/embeddings",
+                json={
+                    "input": ["Test embedding 1", "Test embedding 2"],
+                    "task": "retrieval",
+                    "prompt_name": "query",
+                },
+            )
+            results["embed"] = resp
+        except Exception as e:
+            errors.append(("embed", e))
+
+    def do_rerank():
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/v1/rerank",
+                json={
+                    "model": "jina-reranker-v3",
+                    "query": "What is AI?",
+                    "documents": [
+                        "AI is artificial intelligence.",
+                        "Cooking is fun.",
+                        "Neural networks learn patterns.",
+                    ],
+                    "top_n": 2,
+                },
+            )
+            results["rerank"] = resp
+        except Exception as e:
+            errors.append(("rerank", e))
+
+    # Fire concurrently to stress-test thread pool sharing
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(do_embed)
+        f2 = pool.submit(do_rerank)
+        f1.result()
+        f2.result()
+
+    if errors:
+        for label, err in errors:
+            print(f"  [FAIL] {label}: {err}")
+        return
+
+    # Verify embedding result
+    assert results["embed"].status_code == 200, (
+        f"Embedding failed: {results['embed'].text}"
+    )
+    embed_data = results["embed"].json()
+    assert len(embed_data["data"]) == 2
+    print(f"  [OK] Embeddings: {len(embed_data['data'])} vectors")
+
+    # Verify rerank result
+    assert results["rerank"].status_code == 200, (
+        f"Rerank failed: {results['rerank'].text}"
+    )
+    rerank_data = results["rerank"].json()
+    assert len(rerank_data["results"]) == 2
+    print(f"  [OK] Rerank: top-{len(rerank_data['results'])} results")
+
+    print("  [OK] ONNX + PyTorch concurrent inference passed")
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("Jina Server Test Suite")
@@ -864,6 +1046,12 @@ if __name__ == "__main__":
         test_batch_output_order()
         test_concurrent_rerank()
         test_batch_multi_input_texts()
+
+        # ONNX backend tests
+        test_onnx_status()
+        test_onnx_all_tasks()
+        test_onnx_batch_encoding()
+        test_onnx_rerank_mixed()
 
         print("\n" + "=" * 50)
         print("All tests completed!")

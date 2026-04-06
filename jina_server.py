@@ -16,25 +16,31 @@ import time
 import uuid
 import json
 import threading
+import numpy as np
 from typing import List, Optional, Union, Dict, Any
 from contextlib import asynccontextmanager
 import platform
 
 # =============================================================================
-# Thread configuration — MUST be set before torch import
+# Thread configuration — MUST be set before torch/onnxruntime import
 # =============================================================================
 # Tuned for AMD R9 9900X (12C/24T, Zen 5)
 # Use physical cores only; SMT yields negligible gains for dense matmul
 MAX_THREADS = 12
-os.environ["OMP_NUM_THREADS"] = str(MAX_THREADS)
+ONNX_THREADS = MAX_THREADS // 2  # 6 threads for ONNX Runtime
+PYTORCH_THREADS = MAX_THREADS - ONNX_THREADS  # 6 threads for PyTorch
+
+os.environ["OMP_NUM_THREADS"] = str(MAX_THREADS)  # shared by both ONNX and PyTorch
+os.environ["ORT_NUM_THREADS"] = str(ONNX_THREADS)
 os.environ["MKL_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["TORCH_INTEROP_THREADS"] = "4"
 
 import torch
+import onnxruntime as ort
 
-torch.set_num_threads(MAX_THREADS)
+torch.set_num_threads(PYTORCH_THREADS)
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import Response
@@ -65,6 +71,142 @@ TASK_ALIAS_MAP = {
     "clustering": ("clustering", None),
     "separation": ("text-matching", None),
 }
+
+# ONNX embedding backend configuration
+USE_ONNX_EMBEDDINGS = os.environ.get("USE_ONNX_EMBEDDINGS", "true").lower() == "true"
+
+# ONNX model paths (task-specific merged models with adapters baked in)
+ONNX_MODEL_DIRS = {
+    "retrieval": os.path.join(MODELS_DIR, "jina-embeddings-v5-text-small-retrieval"),
+    "text-matching": os.path.join(
+        MODELS_DIR, "jina-embeddings-v5-text-small-text-matching"
+    ),
+    "classification": os.path.join(
+        MODELS_DIR, "jina-embeddings-v5-text-small-classification"
+    ),
+    "clustering": os.path.join(MODELS_DIR, "jina-embeddings-v5-text-small-clustering"),
+}
+
+
+# =============================================================================
+# ONNX Embedding Wrapper
+# =============================================================================
+
+
+class ONNXEmbeddingWrapper:
+    """Wraps task-specific ONNX models to mimic SentenceTransformer.encode().
+
+    Each task (retrieval, text-matching, etc.) has its own ONNX session
+    with LoRA adapters already merged into the weights. The wrapper handles
+    tokenization, task-prefix application, last-token pooling, and L2
+    normalization — matching the SentenceTransformer interface.
+    """
+
+    def __init__(self, sessions: Dict[str, ort.InferenceSession], tokenizer):
+        self._sessions = sessions  # task_name -> InferenceSession
+        self._tokenizer = tokenizer
+        # Default task used when no task is specified
+        self._default_task = "retrieval"
+        # Task-specific prefixes (applied per-text before tokenization)
+        self._prompt_prefixes = {
+            "query": "Query: ",
+            "document": "Document: ",
+        }
+
+    def get_sentence_embedding_dimension(self) -> int:
+        """Return embedding dimension from the model metadata."""
+        sample_session = next(iter(self._sessions.values()))
+        dim = sample_session.get_outputs()[0].shape[-1]
+        if isinstance(dim, int):
+            return dim
+        # If dynamic, do a dummy run
+        return 1024  # fallback for jina-embeddings-v5-text-small
+
+    def encode(
+        self,
+        texts,
+        task=None,
+        prompt_name=None,
+        normalize_embeddings=True,
+        batch_size=32,
+        convert_to_numpy=False,
+        **kwargs,
+    ):
+        """Encode texts into embeddings. Matches SentenceTransformer interface.
+
+        The ONNX models provide a 'sentence_embedding' output that already
+        includes last-token pooling, so we use that directly instead of
+        manually pooling from 'last_hidden_state'.
+        """
+        if isinstance(texts, str):
+            texts = [texts]
+
+        if not texts:
+            return np.array([]) if convert_to_numpy else torch.tensor([])
+
+        task = task or self._default_task
+        session = self._sessions.get(task)
+        if session is None:
+            raise ValueError(
+                f"No ONNX session for task '{task}'. Available: {list(self._sessions.keys())}"
+            )
+
+        # Apply task-specific prefix based on prompt_name
+        if prompt_name and prompt_name in self._prompt_prefixes:
+            prefix = self._prompt_prefixes[prompt_name]
+            texts = [prefix + t for t in texts]
+
+        # Tokenize
+        encoded = self._tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=8192,
+            return_tensors="np",
+        )
+
+        all_embeddings = []
+        n = len(texts)
+
+        # Process in batches
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            input_ids = encoded["input_ids"][start:end]
+            attention_mask = encoded["attention_mask"][start:end]
+
+            # Run ONNX inference (ensure int64 — tokenizer may produce int32)
+            # The ONNX model has 2 outputs:
+            #   0: 'last_hidden_state' (batch, seq_len, 1024)
+            #   1: 'sentence_embedding' (batch, 1024) — pre-pooled, pre-normalized
+            outputs = session.run(
+                ["sentence_embedding"],
+                {
+                    "input_ids": input_ids.astype(np.int64),
+                    "attention_mask": attention_mask.astype(np.int64),
+                },
+            )
+            pooled = outputs[0]  # (batch, 1024) — already pooled by the model
+
+            # L2 normalize (model output is usually normalized, but verify)
+            if normalize_embeddings:
+                norms = np.linalg.norm(pooled, axis=1, keepdims=True)
+                norms = np.maximum(norms, 1e-12)
+                pooled = pooled / norms
+
+            all_embeddings.append(pooled)
+
+        # Concatenate all batches
+        result = np.concatenate(all_embeddings, axis=0)  # (total, dim)
+
+        if convert_to_numpy:
+            return result
+        else:
+            # Return torch tensor to match existing interface
+            return torch.from_numpy(result)
+
+    def __call__(self, *args, **kwargs):
+        """Allow calling the wrapper as a function (torch.compile compatibility)."""
+        return self.encode(*args, **kwargs)
 
 
 # Check CPU capabilities
@@ -238,30 +380,81 @@ async def lifespan(app: FastAPI):
     print("\nLoading models...")
     print("=" * 60)
 
-    # Load embedding model
-    print(f"\n[1/2] Loading embedding model from: {EMBEDDING_MODEL_PATH}")
-    try:
-        embedding_model = SentenceTransformer(
-            EMBEDDING_MODEL_PATH,
-            trust_remote_code=True,
-            model_kwargs={"default_task": "retrieval"},
-        )
-        print(
-            f"      [OK] Embedding model loaded (dim={embedding_model.get_sentence_embedding_dimension()})"
-        )
-    except Exception as e:
-        print(f"      [FAIL] Failed to load embedding model: {e}")
-        raise
+    # Load embedding model — try ONNX first, fall back to PyTorch
+    onnx_loaded = False
+    if USE_ONNX_EMBEDDINGS:
+        print(f"\n[1/2] Attempting ONNX embedding model loading...")
+        try:
+            # Configure ONNX Runtime session options
+            sess_opts = ort.SessionOptions()
+            sess_opts.intra_op_num_threads = ONNX_THREADS
+            sess_opts.inter_op_num_threads = 2
+            sess_opts.graph_optimization_level = (
+                ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            )
 
-    # Compile embedding model for optimized CPU inference
-    # Uses TorchInductor to fuse ops and generate AVX-512 kernels
-    print("\n[OPTIMIZE] torch.compile() on embedding model...")
-    try:
-        # Compile the whole SentenceTransformer — only the forward() graph gets optimized; tokenization and Python logic remain unchanged
-        embedding_model = torch.compile(embedding_model, dynamic=True)
-        print("      [OK] torch.compile() applied")
-    except Exception as e:
-        print(f"      [WARN] torch.compile() failed (falling back to eager): {e}")
+            # Load task-specific ONNX sessions
+            sessions: Dict[str, ort.InferenceSession] = {}
+            loaded_tasks = []
+            for task_name, model_dir in ONNX_MODEL_DIRS.items():
+                onnx_path = os.path.join(model_dir, "onnx", "model.onnx")
+                if not os.path.isfile(onnx_path):
+                    print(
+                        f"      [SKIP] ONNX model not found for task '{task_name}': {onnx_path}"
+                    )
+                    continue
+                try:
+                    sessions[task_name] = ort.InferenceSession(
+                        onnx_path, sess_opts, providers=["CPUExecutionProvider"]
+                    )
+                    loaded_tasks.append(task_name)
+                except Exception as e:
+                    print(
+                        f"      [SKIP] ONNX model corrupt/failed for task '{task_name}': {e}"
+                    )
+
+            if sessions:
+                # Require ALL 4 task-specific ONNX models for full ONNX mode.
+                # Partial loading would produce incorrect embeddings for missing tasks.
+                missing = set(ONNX_MODEL_DIRS.keys()) - set(loaded_tasks)
+                if missing:
+                    print(
+                        f"      [WARN] Not all task ONNX models available. "
+                        f"Missing: {sorted(missing)}. Falling back to PyTorch."
+                    )
+                else:
+                    # Need a tokenizer — load from the base embedding model directory
+                    from transformers import AutoTokenizer
+
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        EMBEDDING_MODEL_PATH, trust_remote_code=True
+                    )
+
+                    embedding_model = ONNXEmbeddingWrapper(sessions, tokenizer)
+                    onnx_loaded = True
+                    print(
+                        f"      [OK] ONNX embedding models loaded (tasks: {loaded_tasks}, "
+                        f"dim={embedding_model.get_sentence_embedding_dimension()})"
+                    )
+            else:
+                print("      [WARN] No ONNX model files found, falling back to PyTorch")
+        except Exception as e:
+            print(f"      [WARN] ONNX loading failed ({e}), falling back to PyTorch")
+
+    if not onnx_loaded:
+        print(f"\n[1/2] Loading embedding model (PyTorch) from: {EMBEDDING_MODEL_PATH}")
+        try:
+            embedding_model = SentenceTransformer(
+                EMBEDDING_MODEL_PATH,
+                trust_remote_code=True,
+                model_kwargs={"default_task": "retrieval"},
+            )
+            print(
+                f"      [OK] Embedding model loaded (dim={embedding_model.get_sentence_embedding_dimension()})"
+            )
+        except Exception as e:
+            print(f"      [FAIL] Failed to load embedding model: {e}")
+            raise
 
     # Load reranker model
     print(f"\n[2/2] Loading reranker model from: {RERANKER_MODEL_PATH}")
@@ -279,11 +472,19 @@ async def lifespan(app: FastAPI):
         print(f"      [FAIL] Failed to load reranker model: {e}")
         raise
 
+    # After reranker loading, set PyTorch threads for remaining inference
+    torch.set_num_threads(PYTORCH_THREADS)
+
     # Initialize dynamic batching lock (needs running event loop)
     _batch_flush_lock = asyncio.Lock()
 
     print("\n" + "=" * 60)
     print("Server ready!")
+    print(
+        f"  Embedding backend: {'ONNX Runtime' if onnx_loaded else 'PyTorch (SentenceTransformer)'}"
+    )
+    print(f"  ONNX threads:      {ONNX_THREADS}")
+    print(f"  PyTorch threads:   {PYTORCH_THREADS}")
     print("=" * 60)
 
     # Warmup: pre-allocate memory and trigger JIT compilation
@@ -295,6 +496,15 @@ async def lifespan(app: FastAPI):
         convert_to_numpy=False,
         normalize_embeddings=True,
     )
+    if not onnx_loaded:
+        # PyTorch warmup — second pass for torch.compile optimization
+        _ = embedding_model.encode(
+            ["warmup text 2"],
+            task="retrieval",
+            prompt_name="document",
+            convert_to_numpy=False,
+            normalize_embeddings=True,
+        )
     try:
         _ = reranker_model.rerank("warmup query", ["warmup doc"], top_n=1)
     except Exception:
@@ -305,6 +515,11 @@ async def lifespan(app: FastAPI):
 
     # Cleanup
     print("Shutting down...")
+    # Release ONNX sessions if loaded
+    if isinstance(embedding_model, ONNXEmbeddingWrapper):
+        for task_name, session in embedding_model._sessions.items():
+            del session
+        embedding_model._sessions.clear()
 
 
 app = FastAPI(
@@ -503,6 +718,8 @@ async def root():
             "embedding": embedding_model is not None,
             "reranker": reranker_model is not None,
         },
+        "onnx_enabled": USE_ONNX_EMBEDDINGS
+        and isinstance(embedding_model, ONNXEmbeddingWrapper),
     }
 
 

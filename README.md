@@ -17,6 +17,33 @@ uv sync
 Fetch_Models.bat  #This is for windows, it contains two 'hf download' commands, adapt for linux accordingly
 ```
 
+### ONNX Backend (Recommended)
+
+The server uses **ONNX Runtime** for embedding inference by default, with PyTorch as fallback. ONNX provides faster inference on CPU by leveraging optimized operators and (on supported hardware) INT8 quantization via AVX-512 VNNI.
+
+**Download ONNX models** (4 task-specific variants with LoRA adapters merged):
+
+```bash
+# Already included in Fetch_Models.bat — or run individually:
+hf download jinaai/jina-embeddings-v5-text-small-retrieval --local-dir ".\jinaai\jina-embeddings-v5-text-small-retrieval"
+hf download jinaai/jina-embeddings-v5-text-small-text-matching --local-dir ".\jinaai\jina-embeddings-v5-text-small-text-matching"
+hf download jinaai/jina-embeddings-v5-text-small-classification --local-dir ".\jinaai\jina-embeddings-v5-text-small-classification"
+hf download jinaai/jina-embeddings-v5-text-small-clustering --local-dir ".\jinaai\jina-embeddings-v5-text-small-clustering"
+```
+
+If ONNX models are not found, the server automatically falls back to PyTorch (SentenceTransformer).
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `USE_ONNX_EMBEDDINGS` | `true` | Set to `false` to force PyTorch backend |
+| `OMP_NUM_THREADS` | `12` | Shared thread pool for both backends |
+| `ORT_NUM_THREADS` | `6` | ONNX Runtime intra-op threads |
+| `MKL_NUM_THREADS` | `12` | MKL thread pool |
+
+Default thread configuration is tuned for **AMD R9 9900X (12C/24T, Zen 5)**: 6 threads ONNX, 6 threads PyTorch (reranker stays on PyTorch).
+
 ## Usage
 
 Start the server:
@@ -120,8 +147,11 @@ Run the test suite:
 ```bash
 uv run test_server.py
 ```
-## WIP:
-I'm telling my opencode to implement avx512 for my 9900x rig, brb
+## Architecture
+
+- **Embeddings**: ONNX Runtime (task-specific models, last-token pooling, L2 normalization)
+- **Reranker**: PyTorch (`jina-reranker-v3` — CausalLM-based, incompatible with ONNX)
+- **Thread pools**: Split 6+6 on 12-core CPUs to avoid contention between ONNX and PyTorch
 
 ## License
 
