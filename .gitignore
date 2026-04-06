@@ -27,3 +27,4 @@ jinaai/
 # OS
 .DS_Store
 Thumbs.db
+.sisyphus/
