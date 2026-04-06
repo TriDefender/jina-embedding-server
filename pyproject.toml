@@ -3,14 +3,14 @@ name = "jina-server"
 version = "1.0.0"
 description = "OpenAI-compatible API for Jina embeddings and reranking"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 
 dependencies = [
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
     "pydantic>=2.0.0",
-    "torch>=2.0.0",
+    "torch>=2.11.0",
     "transformers>=4.40.0",
     "sentence-transformers>=2.2.0",
     "safetensors>=0.4.0",
@@ -29,6 +29,3 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.uv]
-dev-dependencies = []
