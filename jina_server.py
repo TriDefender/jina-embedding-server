@@ -9,25 +9,37 @@ Endpoints:
   - POST /v1/batches     (OpenAI Batch API)
 """
 
+import asyncio
 import os
 import sys
 import time
 import uuid
 import json
-import asyncio
-import tempfile
-from datetime import datetime
+import threading
 from typing import List, Optional, Union, Dict, Any
 from contextlib import asynccontextmanager
 import platform
 
+# =============================================================================
+# Thread configuration — MUST be set before torch import
+# =============================================================================
+# Tuned for AMD R9 9900X (12C/24T, Zen 5)
+# Use physical cores only; SMT yields negligible gains for dense matmul
+MAX_THREADS = 12
+os.environ["OMP_NUM_THREADS"] = str(MAX_THREADS)
+os.environ["MKL_NUM_THREADS"] = str(MAX_THREADS)
+os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_THREADS)
+os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
+os.environ["TORCH_INTEROP_THREADS"] = "4"
+
 import torch
-import numpy as np
+
+torch.set_num_threads(MAX_THREADS)
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer
 
 
 # =============================================================================
@@ -53,14 +65,6 @@ TASK_ALIAS_MAP = {
     "clustering": ("clustering", None),
     "separation": ("text-matching", None),
 }
-
-# CPU configuration
-MAX_THREADS = 20  # Limit to 20 cores as requested
-torch.set_num_threads(MAX_THREADS)
-os.environ["OMP_NUM_THREADS"] = str(MAX_THREADS)
-os.environ["MKL_NUM_THREADS"] = str(MAX_THREADS)
-os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_THREADS)
-os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
 
 
 # Check CPU capabilities
@@ -104,10 +108,105 @@ def check_cpu_capabilities():
 # Global model references
 embedding_model = None
 reranker_model = None
+reranker_lock = threading.Lock()  # Protects reranker_model._block_size mutations
 
 # In-memory storage for Files and Batches
 files_storage: Dict[str, Dict[str, Any]] = {}  # file_id -> file metadata + content
 batches_storage: Dict[str, Dict[str, Any]] = {}  # batch_id -> batch metadata
+
+# ---------------------------------------------------------------------------
+# Dynamic batching infrastructure for /v1/embeddings
+# ---------------------------------------------------------------------------
+BATCH_WINDOW_MS = 50  # How long to wait before firing a batch (ms)
+BATCH_MAX_SIZE = 64  # Max requests to accumulate before firing early
+
+
+class _PendingEmbedRequest:
+    """Holds a single request awaiting batch encoding."""
+
+    __slots__ = ("texts", "task", "prompt_name", "batch_size", "future")
+
+    def __init__(self, texts, task, prompt_name, batch_size, future):
+        self.texts = texts
+        self.task = task
+        self.prompt_name = prompt_name
+        self.batch_size = batch_size
+        self.future = future
+
+
+_pending_embeddings: list[_PendingEmbedRequest] = []
+_batch_flush_lock: asyncio.Lock | None = None
+_batch_timer_handle: asyncio.TimerHandle | None = None
+
+
+async def _flush_embedding_batch():
+    """Drain pending requests, group by (task, prompt_name), batch-encode."""
+    global _pending_embeddings
+    if not _pending_embeddings:
+        return
+    # Grab everything in the queue
+    batch = _pending_embeddings[:]
+    _pending_embeddings = []
+
+    # Group by (task, prompt_name)
+    groups: Dict[tuple, List[_PendingEmbedRequest]] = {}
+    for req in batch:
+        key = (req.task, req.prompt_name)
+        groups.setdefault(key, []).append(req)
+
+    for (task, prompt_name), reqs in groups.items():
+        try:
+            # Flatten texts, track which request they belong to
+            flat_texts: List[str] = []
+            spans: List[tuple] = []  # (req_index, start, end)
+            offset = 0
+            for idx, r in enumerate(reqs):
+                flat_texts.extend(r.texts)
+                spans.append((idx, offset, offset + len(r.texts)))
+                offset += len(r.texts)
+
+            max_bs = max(r.batch_size for r in reqs)
+            encode_kwargs = {
+                "task": task,
+                "normalize_embeddings": True,
+                "batch_size": max_bs,
+                "convert_to_numpy": False,
+            }
+            if prompt_name is not None:
+                encode_kwargs["prompt_name"] = prompt_name
+
+            all_embs = embedding_model.encode(flat_texts, **encode_kwargs)
+
+            # Distribute results back
+            for req_idx, start, end in spans:
+                reqs[req_idx].future.set_result(all_embs[start:end])
+        except Exception as e:
+            # If encoding fails, propagate to all requests in group
+            for r in reqs:
+                if not r.future.done():
+                    r.future.set_exception(e)
+
+
+def _schedule_batch_flush():
+    """Schedule a flush after BATCH_WINDOW_MS unless one is already pending."""
+    global _batch_timer_handle
+    loop = asyncio.get_running_loop()
+    if _batch_timer_handle is not None and not _batch_timer_handle.cancelled():
+        return  # Already scheduled
+    _batch_timer_handle = loop.call_later(
+        BATCH_WINDOW_MS / 1000.0,
+        lambda: loop.create_task(_safe_flush()),
+    )
+
+
+async def _safe_flush():
+    """Flush with lock to prevent concurrent flushes."""
+    global _batch_timer_handle
+    if _batch_flush_lock is None:
+        return
+    async with _batch_flush_lock:
+        _batch_timer_handle = None  # Allow next request to schedule new timer
+        await _flush_embedding_batch()
 
 
 # =============================================================================
@@ -118,7 +217,7 @@ batches_storage: Dict[str, Dict[str, Any]] = {}  # batch_id -> batch metadata
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load models on startup."""
-    global embedding_model, reranker_model
+    global embedding_model, reranker_model, _batch_flush_lock
 
     # Display CPU capabilities
     cpu_caps = check_cpu_capabilities()
@@ -145,6 +244,7 @@ async def lifespan(app: FastAPI):
         embedding_model = SentenceTransformer(
             EMBEDDING_MODEL_PATH,
             trust_remote_code=True,
+            model_kwargs={"default_task": "retrieval"},
         )
         print(
             f"      [OK] Embedding model loaded (dim={embedding_model.get_sentence_embedding_dimension()})"
@@ -152,6 +252,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"      [FAIL] Failed to load embedding model: {e}")
         raise
+
+    # Compile embedding model for optimized CPU inference
+    # Uses TorchInductor to fuse ops and generate AVX-512 kernels
+    print("\n[OPTIMIZE] torch.compile() on embedding model...")
+    try:
+        # Compile the whole SentenceTransformer — only the forward() graph gets optimized; tokenization and Python logic remain unchanged
+        embedding_model = torch.compile(embedding_model, dynamic=True)
+        print("      [OK] torch.compile() applied")
+    except Exception as e:
+        print(f"      [WARN] torch.compile() failed (falling back to eager): {e}")
 
     # Load reranker model
     print(f"\n[2/2] Loading reranker model from: {RERANKER_MODEL_PATH}")
@@ -169,9 +279,27 @@ async def lifespan(app: FastAPI):
         print(f"      [FAIL] Failed to load reranker model: {e}")
         raise
 
+    # Initialize dynamic batching lock (needs running event loop)
+    _batch_flush_lock = asyncio.Lock()
+
     print("\n" + "=" * 60)
     print("Server ready!")
     print("=" * 60)
+
+    # Warmup: pre-allocate memory and trigger JIT compilation
+    print("\n[WARMUP] Pre-warming models...")
+    _ = embedding_model.encode(
+        ["warmup text"],
+        task="retrieval",
+        prompt_name="query",
+        convert_to_numpy=False,
+        normalize_embeddings=True,
+    )
+    try:
+        _ = reranker_model.rerank("warmup query", ["warmup doc"], top_n=1)
+    except Exception:
+        pass
+    print("      [OK] Models pre-warmed")
 
     yield
 
@@ -182,7 +310,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Jina Embedding & Reranker Server",
     description="OpenAI-compatible API for embeddings + reranking",
-    version="1.0.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -402,7 +530,7 @@ async def list_models():
 async def create_embeddings(request: EmbeddingRequest):
     """
     Create embeddings for input text(s).
-    OpenAI-compatible endpoint.
+    OpenAI-compatible endpoint with dynamic batching.
     """
     if embedding_model is None:
         raise HTTPException(status_code=503, detail="Embedding model not loaded")
@@ -413,28 +541,42 @@ async def create_embeddings(request: EmbeddingRequest):
     if not texts:
         raise HTTPException(status_code=400, detail="Input cannot be empty")
 
-    # Process in batches for better CPU utilization
     start_time = time.time()
-    batch_size = request.batch_size
-    all_embeddings = []
 
-    # Build encode kwargs based on task and prompt_name
-    encode_kwargs = {
-        "task": request.task,
-        "normalize_embeddings": True,
-        "batch_size": batch_size,
-        "convert_to_numpy": True,
-    }
-    if request.prompt_name is not None:
-        encode_kwargs["prompt_name"] = request.prompt_name
+    # Submit to dynamic batch queue when available and request is small enough
+    if _batch_flush_lock is not None and len(texts) <= BATCH_MAX_SIZE:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
 
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i : i + batch_size]
-        batch_embeddings = embedding_model.encode(
-            batch_texts,
-            **encode_kwargs,
+        _pending_embeddings.append(
+            _PendingEmbedRequest(
+                texts=texts,
+                task=request.task,
+                prompt_name=request.prompt_name,
+                batch_size=request.batch_size,
+                future=future,
+            )
         )
-        all_embeddings.extend(batch_embeddings)
+
+        # Flush immediately if we hit max batch size, otherwise schedule timer
+        if len(_pending_embeddings) >= BATCH_MAX_SIZE:
+            loop.create_task(_safe_flush())
+        else:
+            _schedule_batch_flush()
+
+        all_embeddings = await future
+    else:
+        # Fallback: encode directly (large single requests or before lifespan init)
+        encode_kwargs = {
+            "task": request.task,
+            "normalize_embeddings": True,
+            "batch_size": request.batch_size,
+            "convert_to_numpy": False,
+        }
+        if request.prompt_name is not None:
+            encode_kwargs["prompt_name"] = request.prompt_name
+        loop = asyncio.get_running_loop()
+        all_embeddings = embedding_model.encode(texts, **encode_kwargs)
 
     elapsed = time.time() - start_time
     print(
@@ -463,7 +605,7 @@ async def create_embeddings(request: EmbeddingRequest):
         usage={
             "prompt_tokens": total_tokens,
             "total_tokens": total_tokens,
-            "batch_size": batch_size,
+            "batch_size": request.batch_size,
         },
     )
 
@@ -486,18 +628,18 @@ async def rerank(request: RerankRequest):
     # Rerank using model's built-in rerank method with batch control
     start_time = time.time()
 
-    # Update block_size in model for better batching
-    original_block_size = getattr(reranker_model, "_block_size", 125)
-    reranker_model._block_size = request.batch_size
+    # Thread-safe: protect _block_size mutation from concurrent requests
+    with reranker_lock:
+        original_block_size = getattr(reranker_model, "_block_size", 125)
+        reranker_model._block_size = request.batch_size
 
-    results = reranker_model.rerank(
-        query=request.query,
-        documents=request.documents,
-        top_n=request.top_n,
-    )
+        results = reranker_model.rerank(
+            query=request.query,
+            documents=request.documents,
+            top_n=request.top_n,
+        )
 
-    # Restore original block_size
-    reranker_model._block_size = original_block_size
+        reranker_model._block_size = original_block_size
 
     elapsed = time.time() - start_time
     print(
@@ -646,8 +788,34 @@ async def get_file_content(file_id: str):
 # =============================================================================
 
 
+def _build_batch_object(batch: Dict[str, Any]) -> BatchObject:
+    """Construct a BatchObject from batch storage dict."""
+    return BatchObject(
+        id=batch["id"],
+        endpoint=batch["endpoint"],
+        input_file_id=batch["input_file_id"],
+        completion_window=batch["completion_window"],
+        status=batch["status"],
+        created_at=batch["created_at"],
+        in_progress_at=batch.get("in_progress_at"),
+        completed_at=batch.get("completed_at"),
+        failed_at=batch.get("failed_at"),
+        output_file_id=batch.get("output_file_id"),
+        error_file_id=batch.get("error_file_id"),
+        errors=batch.get("errors"),
+        request_counts=batch.get(
+            "request_counts", {"total": 0, "completed": 0, "failed": 0}
+        ),
+        metadata=batch.get("metadata"),
+    )
+
+
 async def process_batch_job(batch_id: str):
-    """Background task to process a batch job."""
+    """Background task to process a batch job.
+
+    Optimization: collect all texts from same task/prompt_name group,
+    batch-encode them in a single model call, then distribute results.
+    """
     global embedding_model
 
     if batch_id not in batches_storage:
@@ -674,136 +842,171 @@ async def process_batch_job(batch_id: str):
             line.strip() for line in input_content.strip().split("\n") if line.strip()
         ]
 
-        results = []
         total_requests = len(lines)
-        completed = 0
-        failed = 0
+        default_batch_size = 32
 
-        # Process each request
+        # ---- Phase 1: Parse all requests, collect valid embedding tasks ----
+        # Group: (task, prompt_name) -> [(line_index, text_list)]
+        task_groups: Dict[tuple, List[tuple]] = {}
+        # Per-line metadata for reconstruction
+        line_meta: List[Dict[str, Any]] = []
+        parse_errors: List[tuple] = []  # (index, custom_id, error_msg)
+
         for i, line in enumerate(lines):
+            custom_id = f"request-{i}"
             try:
                 request_data = json.loads(line)
                 custom_id = request_data.get("custom_id", f"request-{i}")
                 body = request_data.get("body", {})
-                method = request_data.get("method", "POST")
 
-                # Process based on endpoint
-                if (
-                    request_data.get("endpoint") == "/v1/embeddings"
-                    or batch["endpoint"] == "/v1/embeddings"
-                ):
-                    # Extract input texts
-                    input_texts = body.get("input", [])
-                    if isinstance(input_texts, str):
-                        input_texts = [input_texts]
+                endpoint = request_data.get("endpoint") or batch.get("endpoint")
+                if endpoint != "/v1/embeddings":
+                    raise ValueError(f"Unsupported endpoint: {endpoint}")
 
-                    if not input_texts or embedding_model is None:
-                        raise ValueError("No input texts or model not loaded")
+                # Extract input texts
+                input_texts = body.get("input", [])
+                if isinstance(input_texts, str):
+                    input_texts = [input_texts]
+                if not input_texts or embedding_model is None:
+                    raise ValueError("No input texts or model not loaded")
 
-                    # Extract and validate task/prompt_name
-                    batch_size = body.get("batch_size", 32)
-                    task = body.get("task", "retrieval")
-                    prompt_name = body.get("prompt_name", None)
-                    # Resolve dot-notation aliases (e.g. "retrieval.query")
-                    if task in TASK_ALIAS_MAP:
-                        task, prompt_name = TASK_ALIAS_MAP[task]
-                    if task not in VALID_EMBEDDING_TASKS:
-                        raise ValueError(
-                            f"Invalid task '{task}'. Must be one of: {VALID_EMBEDDING_TASKS}"
-                        )
-                    if (
-                        prompt_name is not None
-                        and prompt_name not in VALID_PROMPT_NAMES
-                    ):
-                        raise ValueError(
-                            f"Invalid prompt_name '{prompt_name}'. Must be one of: {VALID_PROMPT_NAMES}"
-                        )
-
-                    # Generate embeddings
-                    encode_kwargs = {
-                        "task": task,
-                        "normalize_embeddings": True,
-                        "batch_size": batch_size,
-                        "convert_to_numpy": True,
-                    }
-                    if prompt_name is not None:
-                        encode_kwargs["prompt_name"] = prompt_name
-                    embeddings = embedding_model.encode(
-                        input_texts,
-                        **encode_kwargs,
+                # Resolve task/prompt_name
+                task = body.get("task", "retrieval")
+                prompt_name = body.get("prompt_name", None)
+                if task in TASK_ALIAS_MAP:
+                    task, prompt_name = TASK_ALIAS_MAP[task]
+                if task not in VALID_EMBEDDING_TASKS:
+                    raise ValueError(
+                        f"Invalid task '{task}'. Must be one of: {VALID_EMBEDDING_TASKS}"
+                    )
+                if prompt_name is not None and prompt_name not in VALID_PROMPT_NAMES:
+                    raise ValueError(
+                        f"Invalid prompt_name '{prompt_name}'. Must be one of: {VALID_PROMPT_NAMES}"
                     )
 
-                    # Build response
-                    response_data = []
-                    total_tokens = 0
-                    for idx, emb in enumerate(embeddings):
-                        response_data.append(
-                            {
-                                "object": "embedding",
-                                "index": idx,
-                                "embedding": emb.tolist(),
-                            }
-                        )
-                        total_tokens += len(input_texts[idx].split()) * 2
+                group_key = (task, prompt_name)
+                if group_key not in task_groups:
+                    task_groups[group_key] = []
+                task_groups[group_key].append((i, input_texts))
 
-                    response = {
+                line_meta.append(
+                    {
+                        "index": i,
+                        "custom_id": custom_id,
+                        "group_key": group_key,
+                        "text_count": len(input_texts),
+                        "model": body.get("model", "jina-embeddings-v5-text-small"),
+                        "texts": input_texts,
+                    }
+                )
+
+            except Exception as e:
+                parse_errors.append((i, custom_id, str(e)))
+
+        # ---- Phase 2: Batch-encode per (task, prompt_name) group ----
+        # Maps: line_index -> list[torch.Tensor] (embeddings for that line)
+        embeddings_by_line: Dict[int, list] = {}
+
+        for (task, prompt_name), entries in task_groups.items():
+            # Flatten all texts in this group, tracking which line they belong to
+            flat_texts: List[str] = []
+            line_spans: List[tuple] = []  # (line_index, start, end)
+            offset = 0
+            for line_idx, texts in entries:
+                flat_texts.extend(texts)
+                line_spans.append((line_idx, offset, offset + len(texts)))
+                offset += len(texts)
+
+            encode_kwargs = {
+                "task": task,
+                "normalize_embeddings": True,
+                "batch_size": default_batch_size,
+                "convert_to_numpy": False,
+            }
+            if prompt_name is not None:
+                encode_kwargs["prompt_name"] = prompt_name
+
+            all_embs = embedding_model.encode(flat_texts, **encode_kwargs)
+
+            # Distribute embeddings back to their originating lines
+            for line_idx, start, end in line_spans:
+                embeddings_by_line[line_idx] = all_embs[start:end]
+
+        # ---- Phase 3: Build results ----
+        results: List[Dict[str, Any]] = []
+        completed = 0
+        failed = len(parse_errors)
+
+        # Successful lines (in original order)
+        for meta in line_meta:
+            idx = meta["index"]
+            embs = embeddings_by_line.get(idx, [])
+            response_data = []
+            total_tokens = 0
+            for emb_idx, emb in enumerate(embs):
+                response_data.append(
+                    {
+                        "object": "embedding",
+                        "index": emb_idx,
+                        "embedding": emb.tolist(),
+                    }
+                )
+                total_tokens += len(meta["texts"][emb_idx].split()) * 2
+
+            results.append(
+                {
+                    "id": f"resp-{uuid.uuid4().hex[:24]}",
+                    "custom_id": meta["custom_id"],
+                    "response": {
                         "status_code": 200,
                         "body": {
                             "object": "list",
                             "data": response_data,
-                            "model": body.get("model", "jina-embeddings-v5-text-small"),
+                            "model": meta["model"],
                             "usage": {
                                 "prompt_tokens": total_tokens,
                                 "total_tokens": total_tokens,
                             },
                         },
-                    }
-                    completed += 1
-                else:
-                    raise ValueError(
-                        f"Unsupported endpoint: {request_data.get('endpoint')}"
-                    )
+                    },
+                    "error": None,
+                }
+            )
+            completed += 1
 
-                results.append(
-                    {
-                        "id": f"resp-{uuid.uuid4().hex[:24]}",
-                        "custom_id": custom_id,
-                        "response": response,
-                        "error": None,
-                    }
-                )
+        # Failed lines from parse errors
+        for err_idx, custom_id, err_msg in parse_errors:
+            results.append(
+                {
+                    "id": f"resp-{uuid.uuid4().hex[:24]}",
+                    "custom_id": custom_id,
+                    "response": None,
+                    "error": {"message": err_msg, "type": "processing_error"},
+                }
+            )
 
-            except Exception as e:
-                failed += 1
-                results.append(
-                    {
-                        "id": f"resp-{uuid.uuid4().hex[:24]}",
-                        "custom_id": request_data.get("custom_id", f"request-{i}")
-                        if "request_data" in dir()
-                        else f"request-{i}",
-                        "response": None,
-                        "error": {"message": str(e), "type": "processing_error"},
-                    }
-                )
+        # Sort results by original line order
+        results.sort(key=lambda r: r["custom_id"])
 
-            # Update progress
-            batch["request_counts"] = {
-                "total": total_requests,
-                "completed": completed,
-                "failed": failed,
-            }
+        # Update progress
+        batch["request_counts"] = {
+            "total": total_requests,
+            "completed": completed,
+            "failed": failed,
+        }
 
-        # Create output file
+        # ---- Phase 4: Create output file ----
         output_content = "\n".join(json.dumps(r) for r in results)
+        output_bytes = output_content.encode("utf-8")
         output_file_id = f"file-{uuid.uuid4().hex[:24]}"
         files_storage[output_file_id] = {
             "id": output_file_id,
-            "bytes": len(output_content.encode("utf-8")),
+            "bytes": len(output_bytes),
             "created_at": int(time.time()),
             "filename": f"batch_{batch_id}_output.jsonl",
             "purpose": "batch_output",
             "status": "uploaded",
-            "content": output_content.encode("utf-8"),
+            "content": output_bytes,
         }
 
         # Update batch status
@@ -865,41 +1068,15 @@ async def create_batch(request: BatchRequest, background_tasks: BackgroundTasks)
     # Start background processing
     background_tasks.add_task(process_batch_job, batch_id)
 
-    return BatchObject(
-        id=batch_id,
-        endpoint=request.endpoint,
-        input_file_id=request.input_file_id,
-        completion_window=request.completion_window,
-        status="validating",
-        created_at=created_at,
-        metadata=request.metadata,
-    )
+    return _build_batch_object(batch)
 
 
 @app.get("/v1/batches", response_model=BatchListResponse)
 async def list_batches(limit: int = 20):
     """List all batch jobs."""
-    batches = []
-    for batch_id, batch_data in batches_storage.items():
-        batches.append(
-            BatchObject(
-                id=batch_data["id"],
-                endpoint=batch_data["endpoint"],
-                input_file_id=batch_data["input_file_id"],
-                completion_window=batch_data["completion_window"],
-                status=batch_data["status"],
-                created_at=batch_data["created_at"],
-                in_progress_at=batch_data.get("in_progress_at"),
-                completed_at=batch_data.get("completed_at"),
-                failed_at=batch_data.get("failed_at"),
-                output_file_id=batch_data.get("output_file_id"),
-                errors=batch_data.get("errors"),
-                request_counts=batch_data.get(
-                    "request_counts", {"total": 0, "completed": 0, "failed": 0}
-                ),
-                metadata=batch_data.get("metadata"),
-            )
-        )
+    batches = [
+        _build_batch_object(batch_data) for batch_data in batches_storage.values()
+    ]
     return BatchListResponse(object="list", data=batches[:limit])
 
 
@@ -910,23 +1087,7 @@ async def get_batch(batch_id: str):
         raise HTTPException(status_code=404, detail="Batch not found")
 
     batch = batches_storage[batch_id]
-    return BatchObject(
-        id=batch["id"],
-        endpoint=batch["endpoint"],
-        input_file_id=batch["input_file_id"],
-        completion_window=batch["completion_window"],
-        status=batch["status"],
-        created_at=batch["created_at"],
-        in_progress_at=batch.get("in_progress_at"),
-        completed_at=batch.get("completed_at"),
-        failed_at=batch.get("failed_at"),
-        output_file_id=batch.get("output_file_id"),
-        errors=batch.get("errors"),
-        request_counts=batch.get(
-            "request_counts", {"total": 0, "completed": 0, "failed": 0}
-        ),
-        metadata=batch.get("metadata"),
-    )
+    return _build_batch_object(batch)
 
 
 @app.post("/v1/batches/{batch_id}/cancel", response_model=BatchObject)
@@ -948,19 +1109,7 @@ async def cancel_batch(batch_id: str):
 
     print(f"  [BATCH] Cancelled batch {batch_id}")
 
-    return BatchObject(
-        id=batch["id"],
-        endpoint=batch["endpoint"],
-        input_file_id=batch["input_file_id"],
-        completion_window=batch["completion_window"],
-        status=batch["status"],
-        created_at=batch["created_at"],
-        cancelled_at=batch.get("cancelled_at"),
-        request_counts=batch.get(
-            "request_counts", {"total": 0, "completed": 0, "failed": 0}
-        ),
-        metadata=batch.get("metadata"),
-    )
+    return _build_batch_object(batch)
 
 
 # =============================================================================

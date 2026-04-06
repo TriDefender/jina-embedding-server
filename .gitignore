@@ -11,6 +11,7 @@ build/
 venv/
 ENV/
 env/
+.sisyphus/
 
 # IDE
 .vscode/
