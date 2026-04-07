@@ -244,7 +244,10 @@ async def lifespan(app: FastAPI):
         embedding_model = SentenceTransformer(
             EMBEDDING_MODEL_PATH,
             trust_remote_code=True,
-            model_kwargs={"default_task": "retrieval"},
+            model_kwargs={
+                "default_task": "retrieval",
+                "torch_dtype": torch.bfloat16,
+            },
         )
         print(
             f"      [OK] Embedding model loaded (dim={embedding_model.get_sentence_embedding_dimension()})"
@@ -252,14 +255,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"      [FAIL] Failed to load embedding model: {e}")
         raise
-
     # Compile embedding model for optimized CPU inference
-    # Uses TorchInductor to fuse ops and generate AVX-512 kernels
+    # Uses TorchInductor to fuse ops and generate optimized kernels
     print("\n[OPTIMIZE] torch.compile() on embedding model...")
     try:
-        # Compile the whole SentenceTransformer — only the forward() graph gets optimized; tokenization and Python logic remain unchanged
         embedding_model = torch.compile(embedding_model, dynamic=True)
-        print("      [OK] torch.compile() applied")
+        print("      [OK] torch.compile() applied ")
     except Exception as e:
         print(f"      [WARN] torch.compile() failed (falling back to eager): {e}")
 
@@ -271,9 +272,10 @@ async def lifespan(app: FastAPI):
         from modeling import JinaForRanking
         from transformers import AutoConfig
 
-        config = AutoConfig.from_pretrained(RERANKER_MODEL_PATH, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(RERANKER_MODEL_PATH, trust_remote_code=True, dtype=torch.bfloat16)
         reranker_model = JinaForRanking(config)
         reranker_model.eval()
+        reranker_model = torch.compile(reranker_model) 
         print("      [OK] Reranker model loaded")
     except Exception as e:
         print(f"      [FAIL] Failed to load reranker model: {e}")
@@ -289,14 +291,14 @@ async def lifespan(app: FastAPI):
     # Warmup: pre-allocate memory and trigger JIT compilation
     print("\n[WARMUP] Pre-warming models...")
     _ = embedding_model.encode(
-        ["warmup text"],
+        ["dummy_text_here_put_your_string_lol1234567890 vgyfsFewwg4rgeghrafW	EDDDDD₫fvvv俄国v恶个过程各方位"],
         task="retrieval",
         prompt_name="query",
         convert_to_numpy=False,
         normalize_embeddings=True,
     )
     try:
-        _ = reranker_model.rerank("warmup query", ["warmup doc"], top_n=1)
+        _ = reranker_model.rerank("warmup query", ["dummy_text_here_put_your_string_lol"], top_n=1)
     except Exception:
         pass
     print("      [OK] Models pre-warmed")
