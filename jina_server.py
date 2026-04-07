@@ -24,18 +24,17 @@ import platform
 # =============================================================================
 # Thread configuration — MUST be set before torch/onnxruntime import
 # =============================================================================
-# Tuned for AMD R9 9900X (12C/24T, Zen 5)
 # Use physical cores only; SMT yields negligible gains for dense matmul
-MAX_THREADS = 12
-ONNX_THREADS = MAX_THREADS // 2  # 6 threads for ONNX Runtime
-PYTORCH_THREADS = MAX_THREADS - ONNX_THREADS  # 6 threads for PyTorch
+MAX_THREADS = 24
+ONNX_THREADS = 12  
+PYTORCH_THREADS = 12
 
 os.environ["OMP_NUM_THREADS"] = str(MAX_THREADS)  # shared by both ONNX and PyTorch
 os.environ["ORT_NUM_THREADS"] = str(ONNX_THREADS)
 os.environ["MKL_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
-os.environ["TORCH_INTEROP_THREADS"] = "4"
+os.environ["TORCH_INTEROP_THREADS"] = "8"
 
 import torch
 import onnxruntime as ort

@@ -17,7 +17,6 @@ dependencies = [
     "requests>=2.31.0",
     "py-cpuinfo>=9.0.0",
     "python-multipart>=0.0.20",
-    "peft>=0.13.2",
     "onnxruntime>=1.16.0",
 ]
 
