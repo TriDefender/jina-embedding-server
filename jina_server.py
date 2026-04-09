@@ -10,6 +10,7 @@ Endpoints:
 """
 
 import asyncio
+import gc
 import os
 import sys
 import time
@@ -30,7 +31,7 @@ os.environ["OMP_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["MKL_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
-os.environ["TORCH_INTEROP_THREADS"] = "4"
+os.environ["TORCH_INTEROP_THREADS"] = "8"
 
 import torch
 
@@ -40,6 +41,61 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sentence_transformers import SentenceTransformer
+
+# =============================================================================
+# Device & CUDA Configuration
+# =============================================================================
+CUDA_AVAILABLE = torch.cuda.is_available()
+DEVICE = torch.device("cuda" if CUDA_AVAILABLE else "cpu")
+IDLE_TIMEOUT_SECONDS = int(os.environ.get("IDLE_TIMEOUT_SECONDS", "300"))
+
+
+def setup_cuda_optimizations():
+    """Enable NVIDIA GPU optimizations when CUDA is available."""
+    if not CUDA_AVAILABLE:
+        return {}
+    cap = torch.cuda.get_device_capability()
+    info = {
+        "gpu_name": torch.cuda.get_device_name(0),
+        "gpu_memory_gb": round(
+            torch.cuda.get_device_properties(0).total_mem / (1024**3), 1
+        ),
+        "cuda_version": torch.version.cuda,
+        "compute_capability": f"{cap[0]}.{cap[1]}",
+    }
+    # TF32 for Ampere+ (compute capability >= 8.0)
+    if cap >= (8, 0):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        info["tf32_enabled"] = True
+    else:
+        info["tf32_enabled"] = False
+    # cuDNN autotuner
+    torch.backends.cudnn.benchmark = True
+    return info
+
+
+def detect_attention_implementation():
+    """Detect best available attention implementation.
+
+    Priority: flash_attention_2 > sdpa > eager
+    flash_attention_2 requires Ampere+ (sm_80) and flash-attn package.
+    sdpa is available in PyTorch 2.0+ with CUDA.
+    """
+    if not CUDA_AVAILABLE:
+        return "eager"
+    cap = torch.cuda.get_device_capability()
+    if cap >= (8, 0):
+        try:
+            import flash_attn  # noqa: F401
+
+            return "flash_attention_2"
+        except ImportError:
+            pass
+    # PyTorch 2.0+ has native SDPA
+    if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+        return "sdpa"
+    return "eager"
 
 
 # =============================================================================
@@ -67,34 +123,94 @@ TASK_ALIAS_MAP = {
 }
 
 
+# =============================================================================
+# GPU Model Manager — Idle Offloading & Fast Reload
+# =============================================================================
+
+
+class GPUModelManager:
+    """Manages a model's GPU lifecycle: offloading when idle, reloading on demand.
+
+    When CUDA is available:
+    - Models are loaded to GPU at startup
+    - After IDLE_TIMEOUT_SECONDS of no inference, model is moved to CPU RAM (VRAM freed)
+    - On next inference request, model is moved back to GPU with warmup
+    - asyncio.Lock ensures thread-safe device transitions
+
+    When CUDA is not available:
+    - All methods are no-ops; model stays on CPU permanently
+    """
+
+    def __init__(self, model, name: str):
+        self.model = model
+        self.name = name
+        self._on_gpu = DEVICE.type == "cuda"
+        self._last_access = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    @property
+    def is_on_gpu(self) -> bool:
+        return self._on_gpu
+
+    @property
+    def last_access(self) -> float:
+        return self._last_access
+
+    async def ensure_on_device(self):
+        """Ensure model is on the target device (GPU or CPU).
+        Called before every inference. Reloads to GPU if offloaded."""
+        if DEVICE.type != "cuda":
+            self._last_access = time.monotonic()
+            return
+        async with self._lock:
+            if not self._on_gpu:
+                t0 = time.monotonic()
+                self.model.to(DEVICE)
+                self._on_gpu = True
+                elapsed = time.monotonic() - t0
+                print(f"  [GPU] Reloaded '{self.name}' to GPU in {elapsed:.2f}s")
+            self._last_access = time.monotonic()
+
+    async def offload_to_cpu(self):
+        """Move model from GPU to CPU RAM to free VRAM."""
+        if DEVICE.type != "cuda":
+            return
+        async with self._lock:
+            if not self._on_gpu:
+                return
+            self.model.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+            self._on_gpu = False
+            print(f"  [GPU] Offloaded '{self.name}' to CPU (VRAM freed)")
+
+    def get_status(self) -> dict:
+        """Return model status for health endpoint."""
+        loaded = self.model is not None
+        return {
+            "loaded": loaded,
+            "on_gpu": self._on_gpu if loaded else False,
+        }
+
+
 # Check CPU capabilities
 def check_cpu_capabilities():
     """Check CPU instruction set support using py-cpuinfo."""
     import cpuinfo
 
+    info = cpuinfo.get_cpu_info()
+    flags = info.get("flags", [])
+
     cpu_info = {
         "cpu_count": os.cpu_count(),
         "pytorch_threads": torch.get_num_threads(),
         "platform": platform.platform(),
-        "cpu_brand": cpuinfo.get_cpu_info().get("brand_raw", "Unknown"),
-        "avx": False,
-        "avx2": False,
-        "avx512": False,
-        "avx512f": False,
-        "avx512_vnni": False,
+        "cpu_brand": info.get("brand_raw", "Unknown"),
+        "avx": "avx" in flags,
+        "avx2": "avx2" in flags,
+        "avx512f": "avx512f" in flags,
+        "avx512_vnni": "avx512vnni" in flags,
     }
-
-    # Get all CPU flags
-    info = cpuinfo.get_cpu_info()
-    flags = info.get("flags", [])
-
-    # Check instruction set support
-    cpu_info["avx"] = "avx" in flags
-    cpu_info["avx2"] = "avx2" in flags
-    cpu_info["avx512f"] = "avx512f" in flags
-    cpu_info["avx512_vnni"] = "avx512vnni" in flags
-
-    # AVX512 considered supported if F (foundation) is present
     cpu_info["avx512"] = cpu_info["avx512f"]
 
     # Log detailed AVX512 subsets if available
@@ -109,6 +225,10 @@ def check_cpu_capabilities():
 embedding_model = None
 reranker_model = None
 reranker_lock = threading.Lock()  # Protects reranker_model._block_size mutations
+
+# GPU model managers (initialized in lifespan)
+embedding_manager: Optional[GPUModelManager] = None
+reranker_manager: Optional[GPUModelManager] = None
 
 # In-memory storage for Files and Batches
 files_storage: Dict[str, Dict[str, Any]] = {}  # file_id -> file metadata + content
@@ -144,6 +264,9 @@ async def _flush_embedding_batch():
     global _pending_embeddings
     if not _pending_embeddings:
         return
+    # Ensure model is on GPU before encoding
+    if embedding_manager:
+        await embedding_manager.ensure_on_device()
     # Grab everything in the queue
     batch = _pending_embeddings[:]
     _pending_embeddings = []
@@ -166,14 +289,7 @@ async def _flush_embedding_batch():
                 offset += len(r.texts)
 
             max_bs = max(r.batch_size for r in reqs)
-            encode_kwargs = {
-                "task": task,
-                "normalize_embeddings": True,
-                "batch_size": max_bs,
-                "convert_to_numpy": False,
-            }
-            if prompt_name is not None:
-                encode_kwargs["prompt_name"] = prompt_name
+            encode_kwargs = _build_encode_kwargs(task, prompt_name, max_bs)
 
             all_embs = embedding_model.encode(flat_texts, **encode_kwargs)
 
@@ -209,6 +325,21 @@ async def _safe_flush():
         await _flush_embedding_batch()
 
 
+def _build_encode_kwargs(
+    task: str, prompt_name: Optional[str], batch_size: int
+) -> Dict[str, Any]:
+    """Build keyword arguments for SentenceTransformer.encode()."""
+    kwargs: Dict[str, Any] = {
+        "task": task,
+        "normalize_embeddings": True,
+        "batch_size": batch_size,
+        "convert_to_numpy": False,
+    }
+    if prompt_name is not None:
+        kwargs["prompt_name"] = prompt_name
+    return kwargs
+
+
 # =============================================================================
 # Lifespan
 # =============================================================================
@@ -216,23 +347,37 @@ async def _safe_flush():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load models on startup."""
+    """Load models on startup with CUDA support and idle offloading."""
     global embedding_model, reranker_model, _batch_flush_lock
+    global embedding_manager, reranker_manager
 
-    # Display CPU capabilities
+    # Setup CUDA optimizations
+    gpu_info = setup_cuda_optimizations()
+    attn_impl = detect_attention_implementation()
+
+    # Display system information
     cpu_caps = check_cpu_capabilities()
     print("=" * 60)
     print("System Information")
     print("=" * 60)
+    if CUDA_AVAILABLE:
+        print("  CUDA:            Available")
+        print(f"  GPU:             {gpu_info.get('gpu_name', 'Unknown')}")
+        print(f"  GPU Memory:      {gpu_info.get('gpu_memory_gb', 0)} GB")
+        print(f"  CUDA Version:    {gpu_info.get('cuda_version', 'N/A')}")
+        print(f"  Compute Cap:     {gpu_info.get('compute_capability', 'N/A')}")
+        print(f"  TF32:            {gpu_info.get('tf32_enabled', False)}")
+        print(f"  Attention:       {attn_impl}")
+    else:
+        print("  CUDA:            Not available (CPU mode)")
+    print(f"  Device:          {DEVICE}")
     print(f"  Platform:        {cpu_caps['platform']}")
     print(f"  CPU:             {cpu_caps['cpu_brand']}")
     print(f"  CPU Cores:       {cpu_caps['cpu_count']}")
     print(f"  PyTorch Threads: {cpu_caps['pytorch_threads']}")
-    print(f"  AVX:             {cpu_caps['avx']}")
     print(f"  AVX2:            {cpu_caps['avx2']}")
     print(f"  AVX-512:         {cpu_caps['avx512']}")
-    if cpu_caps.get("avx512"):
-        print(f"  AVX-512 Subsets: {', '.join(cpu_caps.get('avx512_subsets', []))}")
+    print(f"  Idle Timeout:    {IDLE_TIMEOUT_SECONDS}s")
     print("=" * 60)
 
     print("\nLoading models...")
@@ -240,72 +385,120 @@ async def lifespan(app: FastAPI):
 
     # Load embedding model
     print(f"\n[1/2] Loading embedding model from: {EMBEDDING_MODEL_PATH}")
+    print(f"      Attention implementation: {attn_impl}")
     try:
         embedding_model = SentenceTransformer(
             EMBEDDING_MODEL_PATH,
             trust_remote_code=True,
+            device=DEVICE,
             model_kwargs={
                 "default_task": "retrieval",
                 "torch_dtype": torch.bfloat16,
+                "default_prompt_name": "query",
+                "attn_implementation": attn_impl,
             },
         )
         print(
-            f"      [OK] Embedding model loaded (dim={embedding_model.get_sentence_embedding_dimension()})"
+            f"      [OK] Embedding model loaded on {DEVICE} (dim={embedding_model.get_sentence_embedding_dimension()})"
         )
     except Exception as e:
         print(f"      [FAIL] Failed to load embedding model: {e}")
         raise
-    # Compile embedding model for optimized CPU inference
-    # Uses TorchInductor to fuse ops and generate optimized kernels
-    print("\n[OPTIMIZE] torch.compile() on embedding model...")
-    try:
-        embedding_model = torch.compile(embedding_model, dynamic=True)
-        print("      [OK] torch.compile() applied ")
-    except Exception as e:
-        print(f"      [WARN] torch.compile() failed (falling back to eager): {e}")
+
+    # torch.compile: only on CPU (GPU already fast; skip to reduce reload time)
+    if DEVICE.type == "cpu":
+        print("\n[OPTIMIZE] torch.compile() on embedding model (CPU)...")
+        try:
+            embedding_model = torch.compile(embedding_model, dynamic=True)
+            print("      [OK] torch.compile() applied")
+        except Exception as e:
+            print(f"      [WARN] torch.compile() failed (falling back to eager): {e}")
+    else:
+        print("\n[OPTIMIZE] Skipping torch.compile() on GPU (faster reload)")
 
     # Load reranker model
     print(f"\n[2/2] Loading reranker model from: {RERANKER_MODEL_PATH}")
+    print(f"      Attention implementation: {attn_impl}")
     try:
-        # Import from local modeling.py to avoid AutoModel issues
         sys.path.insert(0, RERANKER_MODEL_PATH)
         from modeling import JinaForRanking
         from transformers import AutoConfig
 
-        config = AutoConfig.from_pretrained(RERANKER_MODEL_PATH, trust_remote_code=True, dtype=torch.bfloat16)
+        config = AutoConfig.from_pretrained(
+            RERANKER_MODEL_PATH, trust_remote_code=True, dtype=torch.bfloat16
+        )
+        config._attn_implementation = attn_impl
         reranker_model = JinaForRanking(config)
         reranker_model.eval()
-        reranker_model = torch.compile(reranker_model) 
-        print("      [OK] Reranker model loaded")
+        reranker_model.to(DEVICE)
+
+        if DEVICE.type == "cpu":
+            reranker_model = torch.compile(reranker_model, dynamic=True)
+            print("      [OK] Reranker model loaded and compiled (CPU)")
+        else:
+            print(f"      [OK] Reranker model loaded on {DEVICE}")
     except Exception as e:
         print(f"      [FAIL] Failed to load reranker model: {e}")
         raise
+
+    # Initialize GPU model managers
+    embedding_manager = GPUModelManager(embedding_model, "embedding")
+    reranker_manager = GPUModelManager(reranker_model, "reranker")
 
     # Initialize dynamic batching lock (needs running event loop)
     _batch_flush_lock = asyncio.Lock()
 
     print("\n" + "=" * 60)
-    print("Server ready!")
+    print(f"Server ready! (device={DEVICE})")
     print("=" * 60)
 
     # Warmup: pre-allocate memory and trigger JIT compilation
     print("\n[WARMUP] Pre-warming models...")
     _ = embedding_model.encode(
-        ["dummy_text_here_put_your_string_lol1234567890 vgyfsFewwg4rgeghrafW	EDDDDD₫fvvv俄国v恶个过程各方位"],
+        [
+            "dummy_text_here_put_your_string_lol1234567890 vgyfsFewwg4rgeghrafW	EDDDDD₫fvvv俄国v恶个过程各方位"
+        ],
         task="retrieval",
         prompt_name="query",
         convert_to_numpy=False,
         normalize_embeddings=True,
     )
     try:
-        _ = reranker_model.rerank("warmup query", ["dummy_text_here_put_your_string_lol"], top_n=1)
+        _ = reranker_model.rerank(
+            "warmup query", ["dummy_text_here_put_your_string_lol"], top_n=1
+        )
     except Exception:
         pass
-    print("      [OK] Models pre-warmed")
+    if CUDA_AVAILABLE:
+        allocated = torch.cuda.memory_allocated(0) / (1024**3)
+        reserved = torch.cuda.memory_reserved(0) / (1024**3)
+        print("      [OK] Models pre-warmed")
+        print(
+            f"      GPU Memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved"
+        )
+    else:
+        print("      [OK] Models pre-warmed")
+
+    # Start idle offload watcher (GPU only)
+    async def _idle_offload_watcher():
+        """Background task: offload models to CPU after idle timeout."""
+        if DEVICE.type != "cuda":
+            return
+        while True:
+            await asyncio.sleep(30)  # Check every 30 seconds
+            now = time.monotonic()
+            for mgr in [embedding_manager, reranker_manager]:
+                if mgr and mgr.is_on_gpu:
+                    idle_seconds = now - mgr.last_access
+                    if idle_seconds > IDLE_TIMEOUT_SECONDS:
+                        await mgr.offload_to_cpu()
+
+    watcher_task = asyncio.create_task(_idle_offload_watcher())
 
     yield
 
     # Cleanup
+    watcher_task.cancel()
     print("Shutting down...")
 
 
@@ -404,7 +597,7 @@ class RerankRequest(BaseModel):
         default=False, description="Include document text in response"
     )
     batch_size: int = Field(
-        default=64, ge=1, le=256, description="Batch size for reranking"
+        default=32, ge=1, le=256, description="Batch size for reranking"
     )
 
 
@@ -498,14 +691,28 @@ class BatchListResponse(BaseModel):
 
 @app.get("/")
 async def root():
-    """Health check."""
-    return {
+    """Health check with GPU status."""
+    status = {
         "status": "ok",
-        "models": {
-            "embedding": embedding_model is not None,
-            "reranker": reranker_model is not None,
-        },
+        "device": str(DEVICE),
+        "cuda_available": CUDA_AVAILABLE,
+        "models": {},
     }
+    if embedding_manager:
+        status["models"]["embedding"] = embedding_manager.get_status()
+    else:
+        status["models"]["embedding"] = {
+            "loaded": embedding_model is not None,
+            "on_gpu": False,
+        }
+    if reranker_manager:
+        status["models"]["reranker"] = reranker_manager.get_status()
+    else:
+        status["models"]["reranker"] = {
+            "loaded": reranker_model is not None,
+            "on_gpu": False,
+        }
+    return status
 
 
 @app.get("/v1/models")
@@ -569,15 +776,11 @@ async def create_embeddings(request: EmbeddingRequest):
         all_embeddings = await future
     else:
         # Fallback: encode directly (large single requests or before lifespan init)
-        encode_kwargs = {
-            "task": request.task,
-            "normalize_embeddings": True,
-            "batch_size": request.batch_size,
-            "convert_to_numpy": False,
-        }
-        if request.prompt_name is not None:
-            encode_kwargs["prompt_name"] = request.prompt_name
-        loop = asyncio.get_running_loop()
+        if embedding_manager:
+            await embedding_manager.ensure_on_device()
+        encode_kwargs = _build_encode_kwargs(
+            request.task, request.prompt_name, request.batch_size
+        )
         all_embeddings = embedding_model.encode(texts, **encode_kwargs)
 
     elapsed = time.time() - start_time
@@ -630,6 +833,10 @@ async def rerank(request: RerankRequest):
     # Rerank using model's built-in rerank method with batch control
     start_time = time.time()
 
+    # Ensure reranker is on GPU before inference
+    if reranker_manager:
+        await reranker_manager.ensure_on_device()
+
     # Thread-safe: protect _block_size mutation from concurrent requests
     with reranker_lock:
         original_block_size = getattr(reranker_model, "_block_size", 125)
@@ -649,15 +856,14 @@ async def rerank(request: RerankRequest):
     )
 
     # Build response
-    rerank_results = []
-    for r in results:
-        rerank_results.append(
-            RerankResult(
-                index=r["index"],
-                relevance_score=r["relevance_score"],
-                document=r["document"] if request.return_documents else None,
-            )
+    rerank_results = [
+        RerankResult(
+            index=r["index"],
+            relevance_score=r["relevance_score"],
+            document=r["document"] if request.return_documents else None,
         )
+        for r in results
+    ]
 
     # Estimate tokens
     total_tokens = len(request.query.split()) * 2
@@ -681,6 +887,18 @@ async def rerank(request: RerankRequest):
 # =============================================================================
 
 
+def _file_object_from_storage(file_data: Dict[str, Any]) -> FileObject:
+    """Construct a FileObject from files_storage dict."""
+    return FileObject(
+        id=file_data["id"],
+        bytes=file_data["bytes"],
+        created_at=file_data["created_at"],
+        filename=file_data["filename"],
+        purpose=file_data["purpose"],
+        status=file_data.get("status", "uploaded"),
+    )
+
+
 @app.post("/v1/files", response_model=FileObject)
 async def upload_file(file: UploadFile = File(...), purpose: str = "batch"):
     """
@@ -692,6 +910,7 @@ async def upload_file(file: UploadFile = File(...), purpose: str = "batch"):
 
     # Read file content
     content = await file.read()
+    filename = file.filename or "batch.jsonl"
 
     # Generate file ID
     file_id = f"file-{uuid.uuid4().hex[:24]}"
@@ -702,19 +921,19 @@ async def upload_file(file: UploadFile = File(...), purpose: str = "batch"):
         "id": file_id,
         "bytes": len(content),
         "created_at": created_at,
-        "filename": file.filename or "batch.jsonl",
+        "filename": filename,
         "purpose": purpose,
         "status": "uploaded",
         "content": content,
     }
 
-    print(f"  [INFO] Uploaded file {file_id}: {file.filename} ({len(content)} bytes)")
+    print(f"  [INFO] Uploaded file {file_id}: {filename} ({len(content)} bytes)")
 
     return FileObject(
         id=file_id,
         bytes=len(content),
         created_at=created_at,
-        filename=file.filename or "batch.jsonl",
+        filename=filename,
         purpose=purpose,
         status="uploaded",
     )
@@ -723,20 +942,11 @@ async def upload_file(file: UploadFile = File(...), purpose: str = "batch"):
 @app.get("/v1/files", response_model=FileListResponse)
 async def list_files(purpose: str = "batch"):
     """List all uploaded files."""
-    files = []
-    for file_id, file_data in files_storage.items():
-        if purpose and file_data.get("purpose") != purpose:
-            continue
-        files.append(
-            FileObject(
-                id=file_data["id"],
-                bytes=file_data["bytes"],
-                created_at=file_data["created_at"],
-                filename=file_data["filename"],
-                purpose=file_data["purpose"],
-                status=file_data.get("status", "uploaded"),
-            )
-        )
+    files = [
+        _file_object_from_storage(file_data)
+        for file_data in files_storage.values()
+        if not purpose or file_data.get("purpose") == purpose
+    ]
     return FileListResponse(object="list", data=files)
 
 
@@ -747,14 +957,7 @@ async def get_file(file_id: str):
         raise HTTPException(status_code=404, detail="File not found")
 
     file_data = files_storage[file_id]
-    return FileObject(
-        id=file_data["id"],
-        bytes=file_data["bytes"],
-        created_at=file_data["created_at"],
-        filename=file_data["filename"],
-        purpose=file_data["purpose"],
-        status=file_data.get("status", "uploaded"),
-    )
+    return _file_object_from_storage(file_data)
 
 
 @app.delete("/v1/files/{file_id}")
@@ -822,6 +1025,10 @@ async def process_batch_job(batch_id: str):
 
     if batch_id not in batches_storage:
         return
+
+    # Ensure model is on GPU before batch encoding
+    if embedding_manager:
+        await embedding_manager.ensure_on_device()
 
     batch = batches_storage[batch_id]
     input_file_id = batch["input_file_id"]
@@ -919,14 +1126,7 @@ async def process_batch_job(batch_id: str):
                 line_spans.append((line_idx, offset, offset + len(texts)))
                 offset += len(texts)
 
-            encode_kwargs = {
-                "task": task,
-                "normalize_embeddings": True,
-                "batch_size": default_batch_size,
-                "convert_to_numpy": False,
-            }
-            if prompt_name is not None:
-                encode_kwargs["prompt_name"] = prompt_name
+            encode_kwargs = _build_encode_kwargs(task, prompt_name, default_batch_size)
 
             all_embs = embedding_model.encode(flat_texts, **encode_kwargs)
 
@@ -989,13 +1189,6 @@ async def process_batch_job(batch_id: str):
 
         # Sort results by original line order
         results.sort(key=lambda r: r["custom_id"])
-
-        # Update progress
-        batch["request_counts"] = {
-            "total": total_requests,
-            "completed": completed,
-            "failed": failed,
-        }
 
         # ---- Phase 4: Create output file ----
         output_content = "\n".join(json.dumps(r) for r in results)
