@@ -32,6 +32,9 @@ os.environ["MKL_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["TORCH_INTEROP_THREADS"] = "8"
+# CUDA allocator config: must be set BEFORE torch import to take effect.
+# Reduces VRAM fragmentation for models that frequently load/unload.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
@@ -51,9 +54,6 @@ IDLE_TIMEOUT_SECONDS = int(os.environ.get("IDLE_TIMEOUT_SECONDS", "300"))
 # torch.compile on GPU: disabled by default for fast reload (~1-2s vs ~10-30s).
 # Enable for maximum throughput on serial requests at the cost of slow first reload.
 COMPILE_ON_GPU = os.environ.get("COMPILE_ON_GPU", "0") == "1"
-# CUDA memory allocator: reduce fragmentation for models that load/unload frequently
-if CUDA_AVAILABLE:
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def setup_cuda_optimizations():
@@ -170,11 +170,13 @@ class GPUModelManager:
         return self._last_access
 
     def _pin_cpu_parameters(self):
-        """Pin model parameters in CPU memory for faster DMA transfer to GPU.
+        """Pin model parameters in CPU memory for potential DMA transfer speedup.
 
         Pinned (page-locked) memory enables direct DMA transfer to GPU,
-        bypassing the staging buffer. This speeds up reload by ~2x for
-        large models (~1.2GB per model).
+        bypassing the internal staging buffer. Note: the actual speedup for
+        synchronous model.to() is modest (~10-30%); real gains come from
+        non_blocking=True with CUDA stream overlap, which is not used here
+        due to simplicity. Kept as a best-effort optimization.
         """
         if not CUDA_AVAILABLE:
             return
@@ -185,8 +187,8 @@ class GPUModelManager:
             for buf in self.model.buffers():
                 if buf.device.type == "cpu" and not buf.is_pinned():
                     buf.data = buf.data.pin_memory()
-        except Exception:
-            pass  # Non-critical; pin_memory may fail in some edge cases
+        except Exception as e:
+            print(f"  [WARN] pin_memory failed for '{self.name}': {e}")
 
     async def ensure_on_device(self):
         """Ensure model is on the target device (GPU or CPU).
@@ -198,8 +200,8 @@ class GPUModelManager:
             if not self._on_gpu:
                 t0 = time.monotonic()
                 self.model.to(DEVICE)
-                # Synchronize to ensure transfer completes before inference
-                torch.cuda.synchronize()
+                # model.to() with default non_blocking=False already
+                # calls cudaStreamSynchronize internally per parameter.
                 self._on_gpu = True
                 elapsed = time.monotonic() - t0
                 print(f"  [GPU] Reloaded '{self.name}' to GPU in {elapsed:.2f}s")
