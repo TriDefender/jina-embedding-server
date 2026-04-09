@@ -28,3 +28,6 @@ jinaai/
 # OS
 .DS_Store
 Thumbs.db
+
+# PyTorch compile cache
+%TEMP%/
