@@ -64,7 +64,7 @@ def setup_cuda_optimizations():
     info = {
         "gpu_name": torch.cuda.get_device_name(0),
         "gpu_memory_gb": round(
-            torch.cuda.get_device_properties(0).total_mem / (1024**3), 1
+            torch.cuda.get_device_properties(0).total_memory / (1024**3), 1
         ),
         "cuda_version": torch.version.cuda,
         "compute_capability": f"{cap[0]}.{cap[1]}",
