@@ -33,7 +33,8 @@ os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["TORCH_INTEROP_THREADS"] = "8"
 # CUDA allocator config: must be set BEFORE torch import to take effect.
-# Reduces VRAM fragmentation for models that frequently load/unload.
+# expandable_segments reduces VRAM fragmentation but is only supported on Linux.
+# On Windows, this setting is silently ignored (with a UserWarning).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
@@ -435,10 +436,10 @@ async def lifespan(app: FastAPI):
             EMBEDDING_MODEL_PATH,
             trust_remote_code=True,
             device=DEVICE,
+            default_prompt_name="query",
             model_kwargs={
                 "default_task": "retrieval",
                 "torch_dtype": torch.bfloat16,
-                "default_prompt_name": "query",
                 "attn_implementation": attn_impl,
             },
         )
