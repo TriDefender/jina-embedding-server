@@ -48,6 +48,12 @@ from sentence_transformers import SentenceTransformer
 CUDA_AVAILABLE = torch.cuda.is_available()
 DEVICE = torch.device("cuda" if CUDA_AVAILABLE else "cpu")
 IDLE_TIMEOUT_SECONDS = int(os.environ.get("IDLE_TIMEOUT_SECONDS", "300"))
+# torch.compile on GPU: disabled by default for fast reload (~1-2s vs ~10-30s).
+# Enable for maximum throughput on serial requests at the cost of slow first reload.
+COMPILE_ON_GPU = os.environ.get("COMPILE_ON_GPU", "0") == "1"
+# CUDA memory allocator: reduce fragmentation for models that load/unload frequently
+if CUDA_AVAILABLE:
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def setup_cuda_optimizations():
@@ -63,14 +69,14 @@ def setup_cuda_optimizations():
         "cuda_version": torch.version.cuda,
         "compute_capability": f"{cap[0]}.{cap[1]}",
     }
-    # TF32 for Ampere+ (compute capability >= 8.0)
+    # TF32 for Ampere+ (compute capability >= 8.0) — ~2x matmul throughput
     if cap >= (8, 0):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         info["tf32_enabled"] = True
     else:
         info["tf32_enabled"] = False
-    # cuDNN autotuner
+    # cuDNN autotuner: finds optimal convolution algorithms for fixed input sizes
     torch.backends.cudnn.benchmark = True
     return info
 
@@ -134,11 +140,18 @@ class GPUModelManager:
     When CUDA is available:
     - Models are loaded to GPU at startup
     - After IDLE_TIMEOUT_SECONDS of no inference, model is moved to CPU RAM (VRAM freed)
-    - On next inference request, model is moved back to GPU with warmup
-    - asyncio.Lock ensures thread-safe device transitions
+    - On next inference request, model is moved back to GPU
+    - Parameters are pinned in CPU memory during offload for faster DMA transfer on reload
+    - asyncio.Lock ensures safe device transitions
 
     When CUDA is not available:
     - All methods are no-ops; model stays on CPU permanently
+
+    torch.compile interaction:
+    - On CPU: model may be compiled (OptimizedModule). Since DEVICE="cpu", manager is no-op.
+    - On GPU with COMPILE_ON_GPU=0: model is raw. Offload/reload work directly.
+    - On GPU with COMPILE_ON_GPU=1: model is compiled. OptimizedModule.to() propagates
+      to underlying parameters correctly in PyTorch 2.x.
     """
 
     def __init__(self, model, name: str):
@@ -156,6 +169,25 @@ class GPUModelManager:
     def last_access(self) -> float:
         return self._last_access
 
+    def _pin_cpu_parameters(self):
+        """Pin model parameters in CPU memory for faster DMA transfer to GPU.
+
+        Pinned (page-locked) memory enables direct DMA transfer to GPU,
+        bypassing the staging buffer. This speeds up reload by ~2x for
+        large models (~1.2GB per model).
+        """
+        if not CUDA_AVAILABLE:
+            return
+        try:
+            for param in self.model.parameters():
+                if param.device.type == "cpu" and not param.is_pinned():
+                    param.data = param.data.pin_memory()
+            for buf in self.model.buffers():
+                if buf.device.type == "cpu" and not buf.is_pinned():
+                    buf.data = buf.data.pin_memory()
+        except Exception:
+            pass  # Non-critical; pin_memory may fail in some edge cases
+
     async def ensure_on_device(self):
         """Ensure model is on the target device (GPU or CPU).
         Called before every inference. Reloads to GPU if offloaded."""
@@ -166,23 +198,31 @@ class GPUModelManager:
             if not self._on_gpu:
                 t0 = time.monotonic()
                 self.model.to(DEVICE)
+                # Synchronize to ensure transfer completes before inference
+                torch.cuda.synchronize()
                 self._on_gpu = True
                 elapsed = time.monotonic() - t0
                 print(f"  [GPU] Reloaded '{self.name}' to GPU in {elapsed:.2f}s")
             self._last_access = time.monotonic()
 
     async def offload_to_cpu(self):
-        """Move model from GPU to CPU RAM to free VRAM."""
+        """Move model from GPU to CPU RAM to free VRAM.
+
+        After moving to CPU, parameters are pinned in page-locked memory
+        to enable faster DMA transfer when reloading to GPU later.
+        """
         if DEVICE.type != "cuda":
             return
         async with self._lock:
             if not self._on_gpu:
                 return
             self.model.to("cpu")
+            # Pin parameters for faster reload via DMA
+            self._pin_cpu_parameters()
             gc.collect()
             torch.cuda.empty_cache()
             self._on_gpu = False
-            print(f"  [GPU] Offloaded '{self.name}' to CPU (VRAM freed)")
+            print(f"  [GPU] Offloaded '{self.name}' to CPU (VRAM freed, params pinned)")
 
     def get_status(self) -> dict:
         """Return model status for health endpoint."""
@@ -378,6 +418,8 @@ async def lifespan(app: FastAPI):
     print(f"  AVX2:            {cpu_caps['avx2']}")
     print(f"  AVX-512:         {cpu_caps['avx512']}")
     print(f"  Idle Timeout:    {IDLE_TIMEOUT_SECONDS}s")
+    if CUDA_AVAILABLE:
+        print(f"  Compile on GPU:  {COMPILE_ON_GPU}")
     print("=" * 60)
 
     print("\nLoading models...")
@@ -405,16 +447,23 @@ async def lifespan(app: FastAPI):
         print(f"      [FAIL] Failed to load embedding model: {e}")
         raise
 
-    # torch.compile: only on CPU (GPU already fast; skip to reduce reload time)
-    if DEVICE.type == "cpu":
-        print("\n[OPTIMIZE] torch.compile() on embedding model (CPU)...")
+    # torch.compile optimization
+    # - CPU: always compile (essential for performance)
+    # - GPU: optional (COMPILE_ON_GPU=1). Adds ~30-50% throughput but makes
+    #   first reload ~10-30s slower due to JIT recompilation after model.to().
+    #   Default: off for fastest reload (~1-2s, just parameter transfer).
+    should_compile = DEVICE.type == "cpu" or COMPILE_ON_GPU
+    if DEVICE.type == "cuda":
+        print(f"      compile_on_gpu: {COMPILE_ON_GPU}")
+    if should_compile:
+        print(f"\n[OPTIMIZE] torch.compile() on embedding model ({DEVICE})...")
         try:
             embedding_model = torch.compile(embedding_model, dynamic=True)
             print("      [OK] torch.compile() applied")
         except Exception as e:
             print(f"      [WARN] torch.compile() failed (falling back to eager): {e}")
     else:
-        print("\n[OPTIMIZE] Skipping torch.compile() on GPU (faster reload)")
+        print("\n[OPTIMIZE] Skipping torch.compile() on GPU (fastest reload)")
 
     # Load reranker model
     print(f"\n[2/2] Loading reranker model from: {RERANKER_MODEL_PATH}")
@@ -432,9 +481,9 @@ async def lifespan(app: FastAPI):
         reranker_model.eval()
         reranker_model.to(DEVICE)
 
-        if DEVICE.type == "cpu":
+        if should_compile:
             reranker_model = torch.compile(reranker_model, dynamic=True)
-            print("      [OK] Reranker model loaded and compiled (CPU)")
+            print(f"      [OK] Reranker model loaded and compiled ({DEVICE})")
         else:
             print(f"      [OK] Reranker model loaded on {DEVICE}")
     except Exception as e:
