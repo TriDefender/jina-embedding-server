@@ -55,6 +55,11 @@ IDLE_TIMEOUT_SECONDS = int(os.environ.get("IDLE_TIMEOUT_SECONDS", "300"))
 # torch.compile on GPU: disabled by default for fast reload (~1-2s vs ~10-30s).
 # Enable for maximum throughput on serial requests at the cost of slow first reload.
 COMPILE_ON_GPU = os.environ.get("COMPILE_ON_GPU", "0") == "1"
+# CUDA Graph for reranker backbone: captures the Qwen3 transformer as CUDA graphs
+# per seq_len bucket, eliminating kernel launch overhead (~10-25% latency reduction).
+# Post-processing (projector + cosine scoring) runs eagerly (variable-shape ops).
+# Lazy capture: graphs are recorded on first encounter with a new bucket size.
+CUDA_GRAPH = os.environ.get("CUDA_GRAPH", "0") == "1" and CUDA_AVAILABLE
 
 
 def setup_cuda_optimizations():
@@ -234,6 +239,191 @@ class GPUModelManager:
             "loaded": loaded,
             "on_gpu": self._on_gpu if loaded else False,
         }
+
+
+# ---------------------------------------------------------------------------
+# CUDA Graph Acceleration for Reranker Backbone
+# ---------------------------------------------------------------------------
+
+
+class _CUDAGraphReranker:
+    """CUDA Graph wrapper for JinaForRanking's transformer backbone.
+
+    Strategy: capture CUDA Graphs for the Qwen3 backbone (heavy compute,
+    fixed output shapes) and run the projector/scoring in eager mode
+    (lightweight, variable shapes due to boolean indexing).
+
+    Uses lazy capture: graphs are recorded on first encounter with a new
+    sequence length bucket.  Falls back to eager for oversized inputs.
+    """
+
+    # Bucket sizes for typical reranker prompt lengths.
+    # Each bucket captures a separate graph; memory ≈ seq_len × hidden_dim × 2 (BF16).
+    SEQ_LEN_BUCKETS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+
+    def __init__(self, model):
+        self.model = model
+        # Set lm_head to Identity once (normally done per forward call)
+        self.model.lm_head = torch.nn.Identity()
+
+        self._pool = torch.cuda.graph_pool_handle()
+        self._graphs: Dict[int, dict] = {}
+        self._eager_fallback = False
+
+        # Import helpers from the dynamically-loaded model module
+        model_module = sys.modules[model.__class__.__module__]
+        self._output_cls = model_module.CausalLMOutputWithScores
+        self._format_fn = model_module.format_docs_prompts_func
+
+    def _find_bucket(self, seq_len: int):
+        """Return the smallest bucket >= *seq_len*, or None if too large."""
+        for b in self.SEQ_LEN_BUCKETS:
+            if b >= seq_len:
+                return b
+        return None
+
+    def _capture(self, seq_len: int):
+        """Capture a CUDA Graph for the Qwen3 backbone at *seq_len*."""
+        g = torch.cuda.CUDAGraph()
+        static_ids = torch.zeros(1, seq_len, dtype=torch.long, device=DEVICE)
+        static_mask = torch.ones(1, seq_len, dtype=torch.long, device=DEVICE)
+
+        with torch.no_grad(), torch.cuda.graph(g, pool=self._pool):
+            backbone_out = self.model.model(
+                input_ids=static_ids,
+                attention_mask=static_mask,
+                use_cache=False,
+                output_hidden_states=True,
+            )
+            static_hidden = backbone_out.hidden_states[-1]
+
+        self._graphs[seq_len] = {
+            "graph": g,
+            "input_ids": static_ids,
+            "attention_mask": static_mask,
+            "hidden_states": static_hidden,
+        }
+        print(f"      [CUDA Graph] Captured reranker backbone: seq_len={seq_len}")
+
+    @torch.no_grad()
+    def compute_single_batch(self, query, docs, instruction=None):
+        """CUDA Graph-accelerated replacement for _compute_single_batch."""
+        if self._eager_fallback:
+            return self.model._compute_single_batch_eager(query, docs, instruction)
+
+        self.model._ensure_tokenizer()
+        device = next(self.model.parameters()).device
+
+        prompt = self._format_fn(
+            query,
+            docs,
+            instruction=instruction,
+            special_tokens=self.model.special_tokens,
+            no_thinking=True,
+        )
+
+        batch = self.model._tokenizer(
+            text=[prompt],
+            padding=True,
+            padding_side="left",
+            return_tensors="pt",
+        ).to(device)
+
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        bs, seq_len = input_ids.shape
+
+        # Find bucket — fall back to eager if input exceeds largest bucket
+        bucket = self._find_bucket(seq_len)
+        if bucket is None:
+            return self._compute_eager_from_ids(input_ids, attention_mask)
+
+        # Capture graph on first encounter
+        if bucket not in self._graphs:
+            try:
+                self._capture(bucket)
+            except Exception as e:
+                print(f"      [WARN] CUDA Graph capture failed (seq_len={bucket}): {e}")
+                print("      [WARN] Falling back to eager mode for reranker")
+                self._eager_fallback = True
+                return self._compute_eager_from_ids(input_ids, attention_mask)
+
+        entry = self._graphs[bucket]
+
+        # Copy inputs into static buffers (preserves memory addresses)
+        entry["input_ids"][:, :seq_len].copy_(input_ids)
+        if seq_len < bucket:
+            entry["input_ids"][:, seq_len:].zero_()
+        entry["attention_mask"][:, :seq_len].copy_(attention_mask)
+        if seq_len < bucket:
+            entry["attention_mask"][:, seq_len:].zero_()
+
+        # ── Replay backbone CUDA Graph ──
+        entry["graph"].replay()
+
+        # Extract hidden states for actual sequence length
+        hidden_states = entry["hidden_states"][:, :seq_len, :]
+        dim = hidden_states.shape[-1]
+
+        # ── Eager post-processing (variable-shape ops: boolean indexing) ──
+        query_idx = torch.eq(input_ids, self.model.query_embed_token_id)
+        doc_idx = torch.eq(input_ids, self.model.doc_embed_token_id)
+
+        doc_embeds = hidden_states[doc_idx].view(bs, -1, dim)
+        query_embeds = hidden_states[query_idx].unsqueeze(1)
+
+        doc_embeds = self.model.projector(doc_embeds)
+        query_embeds = self.model.projector(query_embeds)
+
+        query_expanded = query_embeds.expand_as(doc_embeds)
+        scores = torch.nn.functional.cosine_similarity(
+            doc_embeds, query_expanded, dim=-1
+        ).squeeze(-1)
+
+        return self._output_cls(
+            loss=None,
+            logits=None,
+            scores=scores,
+            query_embeds=query_embeds,
+            doc_embeds=doc_embeds,
+            past_key_values=None,
+            hidden_states=None,
+            attentions=None,
+        )
+
+    def _compute_eager_from_ids(self, input_ids, attention_mask):
+        """Eager fallback via the original forward method."""
+        return self.model.forward(input_ids=input_ids, attention_mask=attention_mask)
+
+    def warmup(self):
+        """Pre-capture a medium-sized graph during startup."""
+        if self._eager_fallback:
+            return
+        try:
+            if 512 not in self._graphs:
+                self._capture(512)
+        except Exception as e:
+            print(f"      [WARN] CUDA Graph warmup failed: {e}")
+            self._eager_fallback = True
+
+
+def _enable_cudagraph_reranker(model):
+    """Enable CUDA Graph acceleration on a JinaForRanking model.
+
+    Monkey-patches ``_compute_single_batch`` with a version that captures
+    the Qwen3 backbone for fixed-shape buckets and runs projector/scoring
+    eagerly.
+    """
+    state = _CUDAGraphReranker(model)
+    # Save original for eager fallback
+    model._compute_single_batch_eager = model._compute_single_batch
+    # Replace with CUDA Graph version
+    model._compute_single_batch = (
+        lambda query, docs, instruction=None: state.compute_single_batch(
+            query, docs, instruction
+        )
+    )
+    return state
 
 
 # Check CPU capabilities
@@ -423,6 +613,7 @@ async def lifespan(app: FastAPI):
     print(f"  Idle Timeout:    {IDLE_TIMEOUT_SECONDS}s")
     if CUDA_AVAILABLE:
         print(f"  Compile on GPU:  {COMPILE_ON_GPU}")
+        print(f"  CUDA Graph:      {CUDA_GRAPH}")
     print("=" * 60)
 
     print("\nLoading models...")
@@ -439,7 +630,7 @@ async def lifespan(app: FastAPI):
             default_prompt_name="query",
             model_kwargs={
                 "default_task": "retrieval",
-                "torch_dtype": torch.bfloat16,
+                "dtype": torch.bfloat16,
                 "attn_implementation": attn_impl,
             },
         )
@@ -469,22 +660,25 @@ async def lifespan(app: FastAPI):
         print("\n[OPTIMIZE] Skipping torch.compile() on GPU (fastest reload)")
 
     # Load reranker model
+    _cudagraph_reranker_state = None
     print(f"\n[2/2] Loading reranker model from: {RERANKER_MODEL_PATH}")
     print(f"      Attention implementation: {attn_impl}")
     try:
-        sys.path.insert(0, RERANKER_MODEL_PATH)
-        from modeling import JinaForRanking
-        from transformers import AutoConfig
+        from transformers import AutoModel
 
-        config = AutoConfig.from_pretrained(
-            RERANKER_MODEL_PATH, trust_remote_code=True, dtype=torch.bfloat16
+        reranker_model = AutoModel.from_pretrained(
+            RERANKER_MODEL_PATH,
+            trust_remote_code=True,
+            dtype=torch.bfloat16,
+            attn_implementation=attn_impl,
         )
-        config._attn_implementation = attn_impl
-        reranker_model = JinaForRanking(config)
         reranker_model.eval()
         reranker_model.to(DEVICE)
 
-        if should_compile:
+        if CUDA_GRAPH:
+            _cudagraph_reranker_state = _enable_cudagraph_reranker(reranker_model)
+            print(f"      [OK] Reranker loaded on {DEVICE} + CUDA Graph backbone")
+        elif should_compile:
             reranker_model = torch.compile(reranker_model, dynamic=True)
             print(f"      [OK] Reranker model loaded and compiled ({DEVICE})")
         else:
@@ -504,7 +698,7 @@ async def lifespan(app: FastAPI):
     print(f"Server ready! (device={DEVICE})")
     print("=" * 60)
 
-    # Warmup: pre-allocate memory and trigger JIT compilation
+    # Warmup: pre-allocate memory, trigger JIT compilation, and capture CUDA Graphs
     print("\n[WARMUP] Pre-warming models...")
     _ = embedding_model.encode(
         [
@@ -515,6 +709,9 @@ async def lifespan(app: FastAPI):
         convert_to_numpy=False,
         normalize_embeddings=True,
     )
+    # Pre-capture a CUDA Graph bucket for the reranker (if enabled)
+    if CUDA_GRAPH and _cudagraph_reranker_state:
+        _cudagraph_reranker_state.warmup()
     try:
         _ = reranker_model.rerank(
             "warmup query", ["dummy_text_here_put_your_string_lol"], top_n=1
@@ -748,6 +945,7 @@ async def root():
         "status": "ok",
         "device": str(DEVICE),
         "cuda_available": CUDA_AVAILABLE,
+        "cuda_graph_reranker": CUDA_GRAPH,
         "models": {},
     }
     if embedding_manager:

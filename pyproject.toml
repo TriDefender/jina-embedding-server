@@ -1,6 +1,6 @@
 [project]
 name = "jina-server"
-version = "1.0.0"
+version = "1.5.0"
 description = "OpenAI-compatible API for Jina embeddings and reranking"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,3 +32,20 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# =============================================================================
+# PyTorch CUDA source — tells uv to pull GPU-enabled torch from PyTorch's index
+# instead of the CPU-only wheel from PyPI.
+#
+# Switch between CPU/GPU:
+#   GPU:  uncomment the [tool.uv.sources] and [[tool.uv.index]] sections below, then `uv sync`
+#   CPU:  comment them out, then `uv sync`
+# =============================================================================
+
+[tool.uv.sources]
+torch = { index = "pytorch-cuda" }
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

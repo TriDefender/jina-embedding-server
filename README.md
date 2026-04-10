@@ -14,6 +14,10 @@ OpenAI-compatible API server for Jina embeddings and reranking models.
 ```bash
 uv sync
 
+#For windows, use a flash attention prebuilt, ignore if your system is running linux:
+
+uv pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.6/flash_attn-2.8.3+cu130torch2.11-cp312-cp312-win_amd64.whl
+
 Fetch_Models.bat  #This is for windows, it contains two 'hf download' commands, adapt for linux accordingly
 ```
 
@@ -120,8 +124,10 @@ Run the test suite:
 ```bash
 uv run test_server.py
 ```
-## WIP:
-I'm telling my opencode to implement avx512 for my 9900x rig, brb
+## Flags:
+
+You can set these flags as environment variables:
+
 
 ## License
 
