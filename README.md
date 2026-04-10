@@ -124,10 +124,16 @@ Run the test suite:
 ```bash
 uv run test_server.py
 ```
-## Flags:
+## Flags
 
 You can set these flags as environment variables:
 
+| Flag | Default | Description |
+|------|---------|-------------|
+| `IDLE_TIMEOUT_SECONDS` | `300` | Seconds of inactivity before offloading models from VRAM to CPU RAM |
+| `COMPILE_ON_GPU` | `0` | Set `1` to enable `torch.compile()` on GPU. Adds ~30-50% throughput but makes first reload after offload ~10-30s (vs ~1-2s without) |
+| `CUDA_GRAPH` | `0` | Set `1` to capture CUDA Graphs for the reranker backbone. Eliminates kernel launch overhead (~10-25% latency reduction). GPU only |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | CUDA memory allocator config. Set before torch import. `expandable_segments` reduces VRAM fragmentation (Linux only; silently ignored on Windows) |
 
 ## License
 
