@@ -208,6 +208,8 @@ class GPUModelManager:
                 self.model.to(DEVICE)
                 # model.to() with default non_blocking=False already
                 # calls cudaStreamSynchronize internally per parameter.
+                # Release orphaned CPU pinned tensors left after transfer.
+                gc.collect()
                 self._on_gpu = True
                 elapsed = time.monotonic() - t0
                 print(f"  [GPU] Reloaded '{self.name}' to GPU in {elapsed:.2f}s")
