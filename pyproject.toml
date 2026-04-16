@@ -18,12 +18,11 @@ dependencies = [
     "py-cpuinfo>=9.0.0",
     "python-multipart>=0.0.20",
     "peft>=0.13.2",
+    "triton-windows>=3.6.0.post26; sys_platform == 'win32'",
+    "triton>=3.6.0; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
-gpu = [
-    "flash-attn>=2.0.0",
-]
 dev = [
     "pytest>=7.0.0",
     "httpx>=0.24.0",

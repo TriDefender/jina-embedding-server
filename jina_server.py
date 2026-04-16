@@ -90,21 +90,13 @@ def setup_cuda_optimizations():
 def detect_attention_implementation():
     """Detect best available attention implementation.
 
-    Priority: flash_attention_2 > sdpa > eager
-    flash_attention_2 requires Ampere+ (sm_80) and flash-attn package.
-    sdpa is available in PyTorch 2.0+ with CUDA.
+    Priority: sdpa > eager
+    SDPA (Scaled Dot Product Attention) is PyTorch's native fused attention,
+    available in 2.0+ with CUDA. Benchmarked faster than flash-attn on this
+    workload.
     """
     if not CUDA_AVAILABLE:
         return "eager"
-    cap = torch.cuda.get_device_capability()
-    if cap >= (8, 0):
-        try:
-            import flash_attn  # noqa: F401
-
-            return "flash_attention_2"
-        except ImportError:
-            pass
-    # PyTorch 2.0+ has native SDPA
     if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
         return "sdpa"
     return "eager"
@@ -654,7 +646,8 @@ async def lifespan(app: FastAPI):
     if should_compile:
         print(f"\n[OPTIMIZE] torch.compile() on embedding model ({DEVICE})...")
         try:
-            embedding_model = torch.compile(embedding_model, dynamic=True)
+            # Refer to 'https://docs.pytorch.org/docs/stable/generated/torch.compile.html' for more information on torch.compile.
+            embedding_model = torch.compile(embedding_model, dynamic=True, mode="max-autotune")
             print("      [OK] torch.compile() applied")
         except Exception as e:
             print(f"      [WARN] torch.compile() failed (falling back to eager): {e}")
@@ -681,7 +674,7 @@ async def lifespan(app: FastAPI):
             _cudagraph_reranker_state = _enable_cudagraph_reranker(reranker_model)
             print(f"      [OK] Reranker loaded on {DEVICE} + CUDA Graph backbone")
         elif should_compile:
-            reranker_model = torch.compile(reranker_model, dynamic=True)
+            reranker_model = torch.compile(reranker_model, dynamic=True, mode="max-autotune")
             print(f"      [OK] Reranker model loaded and compiled ({DEVICE})")
         else:
             print(f"      [OK] Reranker model loaded on {DEVICE}")
