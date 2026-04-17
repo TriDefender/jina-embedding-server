@@ -31,6 +31,9 @@ os.environ["MKL_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["TORCH_INTEROP_THREADS"] = "4"
+os.environ["CUDA_VISIBLE_DEVICES"] = (
+    ""  # Force CPU-only, prevent CUDA context allocation
+)
 
 import torch
 
@@ -246,6 +249,7 @@ async def lifespan(app: FastAPI):
             trust_remote_code=True,
             model_kwargs={
                 "default_task": "retrieval",
+                "default_prompt": "query",
                 "torch_dtype": torch.bfloat16,
                 "attn_implementation": "sdpa",
             },
@@ -283,8 +287,7 @@ async def lifespan(app: FastAPI):
         reranker_model = JinaForRanking(config)
         reranker_model.eval()
         reranker_model = torch.compile(
-            reranker_model, mode="max-autotune", dynamic=True
-        )
+            reranker_model        )
         print("      [OK] Reranker model loaded")
     except Exception as e:
         print(f"      [FAIL] Failed to load reranker model: {e}")
