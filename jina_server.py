@@ -25,15 +25,13 @@ import platform
 # =============================================================================
 # Tuned for AMD R9 9900X (12C/24T, Zen 5)
 # Use physical cores only; SMT yields negligible gains for dense matmul
-MAX_THREADS = 12
+MAX_THREADS = 24
 os.environ["OMP_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["MKL_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
-os.environ["TORCH_INTEROP_THREADS"] = "4"
-os.environ["CUDA_VISIBLE_DEVICES"] = (
-    ""  # Force CPU-only, prevent CUDA context allocation
-)
+os.environ["TORCH_INTEROP_THREADS"] = "8"
+
 
 import torch
 
@@ -254,6 +252,7 @@ async def lifespan(app: FastAPI):
                 "attn_implementation": "sdpa",
             },
         )
+        embedding_model.to(torch.device("cpu"))
         print(
             f"      [OK] Embedding model loaded (dim={embedding_model.get_sentence_embedding_dimension()})"
         )
@@ -265,10 +264,8 @@ async def lifespan(app: FastAPI):
     # dynamic=True: handles variable-length text inputs without recompilation
     print("\n[OPTIMIZE] torch.compile() on embedding model...")
     try:
-        embedding_model = torch.compile(
-            embedding_model, mode="max-autotune", dynamic=True
-        )
-        print("      [OK] torch.compile(mode=max-autotune) applied")
+        embedding_model = torch.compile(embedding_model, dynamic=True, mode="max-autotune")
+        print("      [OK] torch.compile applied")
     except Exception as e:
         print(f"      [WARN] torch.compile() failed (falling back to eager): {e}")
 
@@ -286,8 +283,8 @@ async def lifespan(app: FastAPI):
         config._attn_implementation = "sdpa"
         reranker_model = JinaForRanking(config)
         reranker_model.eval()
-        reranker_model = torch.compile(
-            reranker_model        )
+        reranker_model = torch.compile(reranker_model, mode="max-autotune", dynamic=True)
+        reranker_model.to(torch.device("cpu"))
         print("      [OK] Reranker model loaded")
     except Exception as e:
         print(f"      [FAIL] Failed to load reranker model: {e}")
