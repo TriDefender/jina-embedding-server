@@ -670,6 +670,14 @@ async def lifespan(app: FastAPI):
         reranker_model.eval()
         reranker_model.to(DEVICE)
 
+        # Apply Triton flash attention kernels (fused online-softmax, bf16 tensor cores)
+        if CUDA_AVAILABLE:
+            try:
+                from optimized_kernels import patch_reranker_attention
+                patch_reranker_attention(reranker_model)
+            except Exception as e:
+                print(f"      [WARN] Triton kernel patch failed (falling back to {attn_impl}): {e}")
+
         if CUDA_GRAPH:
             _cudagraph_reranker_state = _enable_cudagraph_reranker(reranker_model)
             print(f"      [OK] Reranker loaded on {DEVICE} + CUDA Graph backbone")
