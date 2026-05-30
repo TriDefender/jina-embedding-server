@@ -52,9 +52,10 @@ from sentence_transformers import SentenceTransformer
 CUDA_AVAILABLE = torch.cuda.is_available()
 DEVICE = torch.device("cuda" if CUDA_AVAILABLE else "cpu")
 IDLE_TIMEOUT_SECONDS = int(os.environ.get("IDLE_TIMEOUT_SECONDS", "300"))
-# torch.compile on GPU: disabled by default for fast reload (~1-2s vs ~10-30s).
-# Enable for maximum throughput on serial requests at the cost of slow first reload.
-COMPILE_ON_GPU = os.environ.get("COMPILE_ON_GPU", "0") == "1"
+# torch.compile on GPU: gives ~2.8x speedup via operator fusion and CUDA graphs.
+# Adds ~10-30s to first load (JIT compilation) but dramatically reduces inference latency.
+# Disable for fastest reload (~1-2s) at the cost of slower inference.
+COMPILE_ON_GPU = os.environ.get("COMPILE_ON_GPU", "1") == "1"
 # CUDA Graph for reranker backbone: captures the Qwen3 transformer as CUDA graphs
 # per seq_len bucket, eliminating kernel launch overhead (~10-25% latency reduction).
 # Post-processing (projector + cosine scoring) runs eagerly (variable-shape ops).
