@@ -31,3 +31,4 @@ Thumbs.db
 
 # PyTorch compile cache
 %TEMP%/
+/autokernel
