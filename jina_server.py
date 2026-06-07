@@ -11,11 +11,11 @@ Endpoints:
 
 import asyncio
 import os
-import sys
 import time
 import uuid
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Union, Dict, Any
 from contextlib import asynccontextmanager
 import platform
@@ -67,6 +67,13 @@ TASK_ALIAS_MAP = {
     "separation": ("text-matching", None),
 }
 
+EMBEDDING_INFERENCE_WORKERS = max(
+    1, int(os.environ.get("JINA_EMBEDDING_INFERENCE_WORKERS", "1"))
+)
+RERANKER_INFERENCE_WORKERS = max(
+    1, int(os.environ.get("JINA_RERANKER_INFERENCE_WORKERS", "1"))
+)
+
 
 # Check CPU capabilities
 def check_cpu_capabilities():
@@ -109,6 +116,8 @@ def check_cpu_capabilities():
 # Global model references
 embedding_model = None
 reranker_model = None
+embedding_executor: ThreadPoolExecutor | None = None
+reranker_executor: ThreadPoolExecutor | None = None
 reranker_lock = threading.Lock()  # Protects reranker_model._block_size mutations
 
 # In-memory storage for Files and Batches
@@ -138,6 +147,58 @@ class _PendingEmbedRequest:
 _pending_embeddings: list[_PendingEmbedRequest] = []
 _batch_flush_lock: asyncio.Lock | None = None
 _batch_timer_handle: asyncio.TimerHandle | None = None
+
+
+def _encode_embeddings_sync(texts: List[str], encode_kwargs: Dict[str, Any]):
+    """Run the blocking embedding model call outside the event loop."""
+    if embedding_model is None:
+        raise RuntimeError("Embedding model not loaded")
+    return embedding_model.encode(texts, **encode_kwargs)
+
+
+async def _encode_embeddings(texts: List[str], encode_kwargs: Dict[str, Any]):
+    """Offload embedding inference to the dedicated inference worker."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        embedding_executor,
+        _encode_embeddings_sync,
+        list(texts),
+        dict(encode_kwargs),
+    )
+
+
+def _rerank_sync(query: str, documents: List[str], top_n: Optional[int], batch_size: int):
+    """Run reranking with temporary batch-size mutation safely restored."""
+    if reranker_model is None:
+        raise RuntimeError("Reranker model not loaded")
+
+    # Thread-safe: protect _block_size mutation from concurrent requests
+    with reranker_lock:
+        original_block_size = getattr(reranker_model, "_block_size", 125)
+        reranker_model._block_size = batch_size
+        try:
+            return reranker_model.rerank(
+                query=query,
+                documents=documents,
+                top_n=top_n,
+            )
+        finally:
+            reranker_model._block_size = original_block_size
+
+
+async def _rerank_documents(
+    query: str, documents: List[str], top_n: Optional[int], batch_size: int
+):
+    """Offload reranker inference to the dedicated inference worker."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        reranker_executor,
+        _rerank_sync,
+        query,
+        list(documents),
+        top_n,
+        batch_size,
+    )
 
 
 async def _flush_embedding_batch():
@@ -176,7 +237,7 @@ async def _flush_embedding_batch():
             if prompt_name is not None:
                 encode_kwargs["prompt_name"] = prompt_name
 
-            all_embs = embedding_model.encode(flat_texts, **encode_kwargs)
+            all_embs = await _encode_embeddings(flat_texts, encode_kwargs)
 
             # Distribute results back
             for req_idx, start, end in spans:
@@ -219,6 +280,7 @@ async def _safe_flush():
 async def lifespan(app: FastAPI):
     """Load models on startup."""
     global embedding_model, reranker_model, _batch_flush_lock
+    global embedding_executor, reranker_executor
 
     # Display CPU capabilities
     cpu_caps = check_cpu_capabilities()
@@ -272,16 +334,14 @@ async def lifespan(app: FastAPI):
     # Load reranker model
     print(f"\n[2/2] Loading reranker model from: {RERANKER_MODEL_PATH}")
     try:
-        # Import from local modeling.py to avoid AutoModel issues
-        sys.path.insert(0, RERANKER_MODEL_PATH)
-        from modeling import JinaForRanking
-        from transformers import AutoConfig
+        from transformers import AutoModel
 
-        config = AutoConfig.from_pretrained(
-            RERANKER_MODEL_PATH, trust_remote_code=True, dtype=torch.bfloat16
+        reranker_model = AutoModel.from_pretrained(
+            RERANKER_MODEL_PATH,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
         )
-        config._attn_implementation = "sdpa"
-        reranker_model = JinaForRanking(config)
         reranker_model.eval()
         reranker_model = torch.compile(reranker_model, mode="max-autotune", dynamic=True)
         reranker_model.to(torch.device("cpu"))
@@ -289,6 +349,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"      [FAIL] Failed to load reranker model: {e}")
         raise
+
+    embedding_executor = ThreadPoolExecutor(
+        max_workers=EMBEDDING_INFERENCE_WORKERS,
+        thread_name_prefix="embedding-inference",
+    )
+    reranker_executor = ThreadPoolExecutor(
+        max_workers=RERANKER_INFERENCE_WORKERS,
+        thread_name_prefix="reranker-inference",
+    )
+    print(
+        "      [OK] Inference workers ready "
+        f"(embedding={EMBEDDING_INFERENCE_WORKERS}, reranker={RERANKER_INFERENCE_WORKERS})"
+    )
 
     # Initialize dynamic batching lock (needs running event loop)
     _batch_flush_lock = asyncio.Lock()
@@ -299,27 +372,39 @@ async def lifespan(app: FastAPI):
 
     # Warmup: pre-allocate memory and trigger JIT compilation
     print("\n[WARMUP] Pre-warming models...")
-    _ = embedding_model.encode(
+    _ = await _encode_embeddings(
         [
             "dummy_text_here_put_your_string_lol1234567890 vgyfsFewwg4rgeghrafW	EDDDDD₫fvvv俄国v恶个过程各方位"
         ],
-        task="retrieval",
-        prompt_name="query",
-        convert_to_numpy=False,
-        normalize_embeddings=True,
+        {
+            "task": "retrieval",
+            "prompt_name": "query",
+            "convert_to_numpy": False,
+            "normalize_embeddings": True,
+        },
     )
     try:
-        _ = reranker_model.rerank(
-            "warmup query", ["dummy_text_here_put_your_string_lol"], top_n=1
+        _ = await _rerank_documents(
+            "warmup query",
+            ["dummy_text_here_put_your_string_lol"],
+            top_n=1,
+            batch_size=64,
         )
     except Exception:
         pass
     print("      [OK] Models pre-warmed")
 
-    yield
-
-    # Cleanup
-    print("Shutting down...")
+    try:
+        yield
+    finally:
+        # Cleanup
+        print("Shutting down...")
+        if embedding_executor is not None:
+            embedding_executor.shutdown(wait=True, cancel_futures=False)
+            embedding_executor = None
+        if reranker_executor is not None:
+            reranker_executor.shutdown(wait=True, cancel_futures=False)
+            reranker_executor = None
 
 
 app = FastAPI(
@@ -590,8 +675,7 @@ async def create_embeddings(request: EmbeddingRequest):
         }
         if request.prompt_name is not None:
             encode_kwargs["prompt_name"] = request.prompt_name
-        loop = asyncio.get_running_loop()
-        all_embeddings = embedding_model.encode(texts, **encode_kwargs)
+        all_embeddings = await _encode_embeddings(texts, encode_kwargs)
 
     elapsed = time.time() - start_time
     print(
@@ -642,19 +726,12 @@ async def rerank(request: RerankRequest):
 
     # Rerank using model's built-in rerank method with batch control
     start_time = time.time()
-
-    # Thread-safe: protect _block_size mutation from concurrent requests
-    with reranker_lock:
-        original_block_size = getattr(reranker_model, "_block_size", 125)
-        reranker_model._block_size = request.batch_size
-
-        results = reranker_model.rerank(
-            query=request.query,
-            documents=request.documents,
-            top_n=request.top_n,
-        )
-
-        reranker_model._block_size = original_block_size
+    results = await _rerank_documents(
+        query=request.query,
+        documents=request.documents,
+        top_n=request.top_n,
+        batch_size=request.batch_size,
+    )
 
     elapsed = time.time() - start_time
     print(
@@ -941,7 +1018,7 @@ async def process_batch_job(batch_id: str):
             if prompt_name is not None:
                 encode_kwargs["prompt_name"] = prompt_name
 
-            all_embs = embedding_model.encode(flat_texts, **encode_kwargs)
+            all_embs = await _encode_embeddings(flat_texts, encode_kwargs)
 
             # Distribute embeddings back to their originating lines
             for line_idx, start, end in line_spans:
