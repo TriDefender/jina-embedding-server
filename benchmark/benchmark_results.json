@@ -1,0 +1,18 @@
+{
+  "env": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python_version": "3.13.9",
+    "torch_version": "2.11.0+cpu",
+    "torch_num_threads": 24,
+    "torch_num_interop_threads": 12,
+    "cpu_count": 24,
+    "cpu_capability": "AVX512",
+    "bf16_supported": true,
+    "bf16_matmul_native": true,
+    "cpu_brand": "AMD Ryzen 9 9900X 12-Core Processor",
+    "has_avx512_bf16": false,
+    "has_avx512_vnni": true,
+    "has_amx_bf16": false,
+    "has_avx512f": true
+  }
+}
