@@ -1,6 +1,8 @@
 # Jina Embedding & Reranker Server
 
 OpenAI-compatible API server for Jina embeddings and reranking models.
+## Note：
+可将`custom_st.py` 放入 `\jinaai\jina-embeddings-v5-text-small` 下，连续进行相同任务时在本机获得1.27x的加速
 
 ## Features
 
