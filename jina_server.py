@@ -530,6 +530,11 @@ async def _flush_embedding_batch():
                 if not r.future.done():
                     r.future.set_exception(e)
 
+    # Return cached activation blocks to the driver; without this they pile
+    # up across flushes and force WDDM to page GPU memory to system RAM.
+    if CUDA_AVAILABLE:
+        torch.cuda.empty_cache()
+
 
 def _schedule_batch_flush():
     """Schedule a flush after BATCH_WINDOW_MS unless one is already pending."""
@@ -1046,7 +1051,10 @@ async def create_embeddings(request: EmbeddingRequest):
     data = []
     total_tokens = 0
 
-    for i, emb in enumerate(all_embeddings):
+    cpu_embeddings = (
+        all_embeddings.detach().cpu() if torch.is_tensor(all_embeddings) else all_embeddings
+    )
+    for i, emb in enumerate(cpu_embeddings):
         data.append(
             EmbeddingObject(
                 object="embedding",
@@ -1384,9 +1392,13 @@ async def process_batch_job(batch_id: str):
 
             all_embs = embedding_model.encode(flat_texts, **encode_kwargs)
 
-            # Distribute embeddings back to their originating lines
+            # Store as CPU tensors so the GPU output is released immediately;
+            # reclaim the forward-pass activation cache before the next group.
             for line_idx, start, end in line_spans:
-                embeddings_by_line[line_idx] = all_embs[start:end]
+                embeddings_by_line[line_idx] = all_embs[start:end].cpu()
+            del all_embs
+            if CUDA_AVAILABLE:
+                torch.cuda.empty_cache()
 
         # ---- Phase 3: Build results ----
         results: List[Dict[str, Any]] = []
@@ -1397,6 +1409,8 @@ async def process_batch_job(batch_id: str):
         for meta in line_meta:
             idx = meta["index"]
             embs = embeddings_by_line.get(idx, [])
+            if torch.is_tensor(embs):
+                embs = embs.detach().cpu()
             response_data = []
             total_tokens = 0
             for emb_idx, emb in enumerate(embs):
@@ -1477,6 +1491,9 @@ async def process_batch_job(batch_id: str):
         batch["failed_at"] = int(time.time())
         batch["errors"] = {"message": str(e)}
         print(f"  [BATCH] Failed batch {batch_id}: {e}")
+    finally:
+        if CUDA_AVAILABLE:
+            torch.cuda.empty_cache()
 
 
 # =============================================================================
