@@ -13,6 +13,9 @@ ENV/
 env/
 .sisyphus/
 
+# Local benchmark measurements
+bench/results/
+
 # IDE
 .vscode/
 .idea/

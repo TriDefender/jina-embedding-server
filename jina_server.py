@@ -23,19 +23,26 @@ import platform
 # =============================================================================
 # Thread configuration — MUST be set before torch import
 # =============================================================================
-# Tuned for AMD R9 9900X (12C/24T, Zen 5)
-# Use physical cores only; SMT yields negligible gains for dense matmul
-MAX_THREADS = 24
+# CPU-serving defaults measured on the local 12-core Ryzen 9 9900X. Environment
+# overrides keep the same tuning surface available on different CPU topologies.
+MAX_THREADS = max(1, int(os.environ.get("JINA_TORCH_THREADS", "12")))
+TORCH_INTEROP_THREADS = max(
+    1, int(os.environ.get("JINA_TORCH_INTEROP_THREADS", "2"))
+)
 os.environ["OMP_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["MKL_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["OPENBLAS_NUM_THREADS"] = str(MAX_THREADS)
 os.environ["NUMEXPR_NUM_THREADS"] = str(MAX_THREADS)
-os.environ["TORCH_INTEROP_THREADS"] = "8"
 
 
 import torch
 
 torch.set_num_threads(MAX_THREADS)
+# `python jina_server.py` executes this file once as __main__ and Uvicorn then
+# imports it again by module name. PyTorch permits this setting exactly once.
+if os.environ.get("_JINA_INTEROP_THREADS_CONFIGURED") != "1":
+    torch.set_num_interop_threads(TORCH_INTEROP_THREADS)
+    os.environ["_JINA_INTEROP_THREADS_CONFIGURED"] = "1"
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import Response
@@ -73,6 +80,36 @@ EMBEDDING_INFERENCE_WORKERS = max(
 RERANKER_INFERENCE_WORKERS = max(
     1, int(os.environ.get("JINA_RERANKER_INFERENCE_WORKERS", "1"))
 )
+RERANKER_DEFAULT_BLOCK_SIZE = int(os.environ.get("JINA_RERANKER_BLOCK_SIZE", "16"))
+if not 1 <= RERANKER_DEFAULT_BLOCK_SIZE <= 256:
+    raise ValueError("JINA_RERANKER_BLOCK_SIZE must be between 1 and 256")
+
+MODEL_DTYPE_NAME = os.environ.get("JINA_MODEL_DTYPE", "bfloat16").lower()
+MODEL_DTYPE = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}.get(MODEL_DTYPE_NAME)
+if MODEL_DTYPE is None:
+    raise ValueError("JINA_MODEL_DTYPE must be 'bfloat16', 'float16', or 'float32'")
+# Eager mode avoids compile warmup/recompilation cost for variable-length API
+# traffic. Enable explicitly after benchmarking a stable production workload.
+TORCH_COMPILE_ENABLED = os.environ.get("JINA_TORCH_COMPILE", "0") not in {
+    "0",
+    "false",
+    "False",
+}
+TORCH_COMPILE_MODE = os.environ.get("JINA_TORCH_COMPILE_MODE", "max-autotune")
+REQUEST_TIMING_LOG = os.environ.get("JINA_REQUEST_TIMING_LOG", "0") in {
+    "1",
+    "true",
+    "True",
+}
+ACCESS_LOG_ENABLED = os.environ.get("JINA_ACCESS_LOG", "0") in {
+    "1",
+    "true",
+    "True",
+}
 
 
 # Check CPU capabilities
@@ -83,6 +120,7 @@ def check_cpu_capabilities():
     cpu_info = {
         "cpu_count": os.cpu_count(),
         "pytorch_threads": torch.get_num_threads(),
+        "pytorch_interop_threads": torch.get_num_interop_threads(),
         "platform": platform.platform(),
         "cpu_brand": cpuinfo.get_cpu_info().get("brand_raw", "Unknown"),
         "avx": False,
@@ -127,8 +165,11 @@ batches_storage: Dict[str, Dict[str, Any]] = {}  # batch_id -> batch metadata
 # ---------------------------------------------------------------------------
 # Dynamic batching infrastructure for /v1/embeddings
 # ---------------------------------------------------------------------------
-BATCH_WINDOW_MS = 50  # How long to wait before firing a batch (ms)
-BATCH_MAX_SIZE = 64  # Max requests to accumulate before firing early
+# A short queue window preserves most burst batching while avoiding 50 ms of
+# avoidable latency for an isolated request. 32 requests matched the best
+# observed CPU encoder batch on this machine.
+BATCH_WINDOW_MS = max(0, int(os.environ.get("JINA_EMBEDDING_BATCH_WINDOW_MS", "5")))
+BATCH_MAX_SIZE = max(1, int(os.environ.get("JINA_EMBEDDING_BATCH_MAX_SIZE", "32")))
 
 
 class _PendingEmbedRequest:
@@ -291,6 +332,7 @@ async def lifespan(app: FastAPI):
     print(f"  CPU:             {cpu_caps['cpu_brand']}")
     print(f"  CPU Cores:       {cpu_caps['cpu_count']}")
     print(f"  PyTorch Threads: {cpu_caps['pytorch_threads']}")
+    print(f"  Interop Threads: {cpu_caps['pytorch_interop_threads']}")
     print(f"  AVX:             {cpu_caps['avx']}")
     print(f"  AVX2:            {cpu_caps['avx2']}")
     print(f"  AVX-512:         {cpu_caps['avx512']}")
@@ -310,26 +352,29 @@ async def lifespan(app: FastAPI):
             model_kwargs={
                 "default_task": "retrieval",
                 "default_prompt": "query",
-                "torch_dtype": torch.bfloat16,
+                "dtype": MODEL_DTYPE,
                 "attn_implementation": "sdpa",
             },
         )
-        embedding_model.to(torch.device("cpu"))
+        embedding_model.to(device=torch.device("cpu"), dtype=MODEL_DTYPE)
         print(
             f"      [OK] Embedding model loaded (dim={embedding_model.get_sentence_embedding_dimension()})"
         )
     except Exception as e:
         print(f"      [FAIL] Failed to load embedding model: {e}")
         raise
-    # Compile embedding model for optimized CPU inference
-    # max-autotune: tries many kernel strategies, picks best for long-running serving
-    # dynamic=True: handles variable-length text inputs without recompilation
-    print("\n[OPTIMIZE] torch.compile() on embedding model...")
-    try:
-        embedding_model = torch.compile(embedding_model, dynamic=True, mode="max-autotune")
-        print("      [OK] torch.compile applied")
-    except Exception as e:
-        print(f"      [WARN] torch.compile() failed (falling back to eager): {e}")
+    if TORCH_COMPILE_ENABLED:
+        # dynamic=True accommodates request batches with different text lengths.
+        print("\n[OPTIMIZE] torch.compile() on embedding model...")
+        try:
+            embedding_model = torch.compile(
+                embedding_model, dynamic=True, mode=TORCH_COMPILE_MODE
+            )
+            print(f"      [OK] torch.compile applied ({TORCH_COMPILE_MODE})")
+        except Exception as e:
+            print(f"      [WARN] torch.compile() failed (falling back to eager): {e}")
+    else:
+        print("\n[OPTIMIZE] torch.compile disabled by JINA_TORCH_COMPILE")
 
     # Load reranker model
     print(f"\n[2/2] Loading reranker model from: {RERANKER_MODEL_PATH}")
@@ -339,12 +384,15 @@ async def lifespan(app: FastAPI):
         reranker_model = AutoModel.from_pretrained(
             RERANKER_MODEL_PATH,
             trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
+            dtype=MODEL_DTYPE,
             attn_implementation="sdpa",
         )
+        reranker_model.to(device=torch.device("cpu"), dtype=MODEL_DTYPE)
         reranker_model.eval()
-        reranker_model = torch.compile(reranker_model, mode="max-autotune", dynamic=True)
-        reranker_model.to(torch.device("cpu"))
+        if TORCH_COMPILE_ENABLED:
+            reranker_model = torch.compile(
+                reranker_model, mode=TORCH_COMPILE_MODE, dynamic=True
+            )
         print("      [OK] Reranker model loaded")
     except Exception as e:
         print(f"      [FAIL] Failed to load reranker model: {e}")
@@ -502,7 +550,10 @@ class RerankRequest(BaseModel):
         default=False, description="Include document text in response"
     )
     batch_size: int = Field(
-        default=64, ge=1, le=256, description="Batch size for reranking"
+        default=RERANKER_DEFAULT_BLOCK_SIZE,
+        ge=1,
+        le=256,
+        description="Maximum documents in one reranker forward pass",
     )
 
 
@@ -677,10 +728,12 @@ async def create_embeddings(request: EmbeddingRequest):
             encode_kwargs["prompt_name"] = request.prompt_name
         all_embeddings = await _encode_embeddings(texts, encode_kwargs)
 
-    elapsed = time.time() - start_time
-    print(
-        f"  [INFO] Processed {len(texts)} texts in {elapsed:.2f}s ({len(texts) / elapsed:.1f} texts/s)"
-    )
+    if REQUEST_TIMING_LOG:
+        elapsed = time.time() - start_time
+        print(
+            f"  [INFO] Processed {len(texts)} texts in {elapsed:.2f}s "
+            f"({len(texts) / elapsed:.1f} texts/s)"
+        )
 
     # Build response
     data = []
@@ -734,9 +787,11 @@ async def rerank(request: RerankRequest):
     )
 
     elapsed = time.time() - start_time
-    print(
-        f"  [INFO] Reranked {len(request.documents)} documents in {elapsed:.2f}s (batch_size={request.batch_size})"
-    )
+    if REQUEST_TIMING_LOG:
+        print(
+            f"  [INFO] Reranked {len(request.documents)} documents in {elapsed:.2f}s "
+            f"(batch_size={request.batch_size})"
+        )
 
     # Build response
     rerank_results = []
@@ -1237,4 +1292,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=False,
+        access_log=ACCESS_LOG_ENABLED,
     )

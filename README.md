@@ -4,6 +4,21 @@ OpenAI-compatible API server for Jina embeddings and reranking models.
 ## Note：
 可将`custom_st.py` 放入 `\jinaai\jina-embeddings-v5-text-small` 下，连续进行相同任务时在本机获得1.27x的加速
 
+## CPU Settings
+
+默认 CPU 参数：BF16、12 个计算线程、2 个 interop 线程、embedding 动态批处理 `5 ms / 32`、rerank block `16`。
+
+可按需覆盖：
+
+```powershell
+$env:JINA_TORCH_THREADS = "12"
+$env:JINA_TORCH_INTEROP_THREADS = "2"
+$env:JINA_MODEL_DTYPE = "bfloat16"
+$env:JINA_EMBEDDING_BATCH_WINDOW_MS = "5"
+$env:JINA_EMBEDDING_BATCH_MAX_SIZE = "32"
+$env:JINA_RERANKER_BLOCK_SIZE = "16"
+```
+
 ## Features
 
 - **Embedding**: jina-embeddings-v5-text-small (with LoRA task adapters)
