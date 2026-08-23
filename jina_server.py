@@ -310,7 +310,7 @@ async def lifespan(app: FastAPI):
             model_kwargs={
                 "default_task": "retrieval",
                 "default_prompt": "query",
-                "torch_dtype": torch.bfloat16,
+                "dtype": torch.bfloat16,
                 "attn_implementation": "sdpa",
             },
         )
@@ -339,7 +339,7 @@ async def lifespan(app: FastAPI):
         reranker_model = AutoModel.from_pretrained(
             RERANKER_MODEL_PATH,
             trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             attn_implementation="sdpa",
         )
         reranker_model.eval()
