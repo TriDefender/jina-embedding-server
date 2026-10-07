@@ -6,31 +6,42 @@ OpenAI-compatible API server for Jina embeddings and reranking models.
 
 ## Performance (Ryzen 9 9900X, BF16, 12 threads, 实测 HTTP 基准，多次运行区间)
 
-| 指标 | 优化前 | 优化后 | 提升 |
+默认配置（零额外内存）：
+
+| 指标 | 优化前 | 默认配置 | 提升 |
 |---|---|---|---|
-| 串行单条 embedding（中位） | ~135 ms | 48–76 ms | **~2.3x** |
-| 批量 8 条（吞吐） | 34.8 texts/s | 49–63 texts/s | ~1.6x |
-| 批量 32 条（吞吐） | 69.1 texts/s | 83–90 texts/s | ~1.3x |
-| 8 并发客户端（RPS） | 44.6 | 52–80 | ~1.4x |
-| 就绪后首请求延迟 | 135 ms | 57–93 ms | ~2x |
-| Rerank 8/32 docs | 254 / 906 ms | 239–270 / 886–953 ms | ~持平 |
-| 就绪时间 | 12.4 s | 14.0 s（+1.6s 合并+预热） | — |
+| 串行单条 embedding（中位） | ~135 ms | 65–73 ms | **~1.9x** |
+| 就绪后首请求延迟 | 135 ms | 74 ms | 1.8x |
+| 批量 8 条（吞吐） | 34.8 texts/s | 43–47 texts/s | ~1.3x |
+| 批量 32 条（吞吐） | 69.1 texts/s | 68–70 texts/s | 持平（前向 GEMM 主导，固定开销占比小） |
+| 8 并发客户端（RPS） | 44.6 | 45–46 | ~持平（服务端批量时间 -25%，被客户端开销压缩） |
+| Rerank 8/32 docs | 254 / 906 ms | 279–297 / 896–948 ms | 持平（前向级 -2~4%，运行噪声内） |
+| 就绪时间 | 12.4 s | 13.2 s | +0.8 s（全任务预热） |
 
-注：本机连续重负载下存在 ±30% 的运行间波动（温控/睿频）；上表为多次独立运行区间，任何单次运行均显著优于基线。常驻内存增加约 4.8 GB（4 份合并模型副本）。
+默认配置的优化手段（全部 PyTorch + 运行时任务切换，无内存代价）：
 
-优化手段（全部保持 PyTorch + 运行时任务切换，`JINA_LORA_MERGE=0` 可整体关闭）：
+1. **短路 SentenceTransformers 每请求的 `.to()/.eval()` 全树扫描**：`encode()` 每次调用遍历 ~4.6k 个子模块（单条 -17ms、10 条批量 -21ms，实测）。默认对 PEFT 模型做实例级 no-op 绑定。
+2. **reranker 直连主干**：运行时补丁绕过 lm_head 与全部 29 层 hidden states 的物化（仅用最后一层），~3% 前向提速，分数逐位一致；不修改模型目录文件，重新下载模型后依然生效。
+3. **动态批处理窗口 5 ms → 2 ms**：串行 -3 ms；2 ms 相对 0 ms 在 8 并发下保留突发合并成批（RPS +42%）。
+4. **启动序列**：retrieval 两种 prompt + 32 条批量 + 两种 rerank 块形状预热，首请求免冷路径。
 
-1. **按任务预合并 LoRA（TaskModelPool）**：启动时把 4 个任务的 LoRA 适配器分别合并成独立的纯 Qwen3 主干副本（每份 ~1.2 GB），推理时 `set_adapter` 退化为指针切换。相比未合并的 PEFT 路径，单条前向 ~3x、批量 ~1.7x（省掉每层 7 个模块的 wrapper 分发与额外 matmul）。合并后的嵌入与 PEFT 输出 cosine ≥ 0.9998，检索排序 Spearman 0.9998。
-2. **短路 SentenceTransformers 每请求的 `.to()/.eval()` 全树遍历**：`encode()` 每次调用都会扫过全部子模块（pool 持有 5 份模型时约 68 ms/次的纯 Python 开销），pool 对 `to/_apply/train` 做 no-op 覆盖。
-3. **reranker 直连主干**：绕过 lm_head 与全部 29 层 hidden states 的物化（仅用最后一层），~3% 前向提速。
-4. **动态批处理窗口 5 ms → 2 ms**：串行延迟 -3 ms，且 8 并发下突发合并成批仍保留（RPS 比窗口 0 ms 高 ~40%）。
-5. **启动序列**：retrieval（主任务）同步合并+预热后立即就绪；其余任务后台合并（各 ~1.5 s，期间请求自动走 PEFT 回退路径，输出等价）。
+可选加速（`JINA_LORA_MERGE=1`，**+4.8 GB 内存**，96 GB 机器无压力）：
+
+| 指标 | 默认配置 | LORA_MERGE=1 |
+|---|---|---|
+| 串行单条 | 65–73 ms | 48–76 ms |
+| 批量 8 条 | 43–47 texts/s | 49–63 texts/s |
+| 批量 32 条 | 68–70 texts/s | 83–90 texts/s |
+| 8 并发 RPS | 45–46 | 52–80 |
+| 就绪时间 | 13.2 s | 14.0 s |
+
+原理：**按任务预合并 LoRA（TaskModelPool）**——启动时把 4 个任务的 LoRA 适配器分别合并成独立的纯 Qwen3 主干副本，推理时 `set_adapter` 退化为指针切换。未合并 PEFT 每层 7 个模块有 wrapper 分发与额外 matmul（裸前向串行 3.0x、批量 1.7x），但合并副本越多、上述 `.to()/.eval()` 扫描越贵，因此 pool 内置了同样的扫描短路。合并质量：嵌入 cosine ≥ 0.9998，检索排序 Spearman 0.9998。retrieval 同步合并后即就绪，其余任务后台合并（各 ~1.5 s，期间走 PEFT 回退，输出等价）。
 
 torch.compile 结论（已充分探索，默认关闭）：本机需 `PYTHONUTF8=0` + `CXX=<MSVC cl.exe>` + `TORCHINDUCTOR_VEC_ISA_OK=1` + `INCLUDE/LIB` 才能编译（全局 `CXX` 指向的 g++ 已损坏、GBK 输出解码崩溃、omp.h 缺失）。打通后生成的内核在 MSVC 上有语法错误，且 profile 显示可融合算子仅占 ~10%（GEMM 占 56-69%），收益上限 5-15%，不值得引入。详见 `bench/compile_ceiling.py` 与 `bench/merged_variants.py`。
 
 ## CPU Settings
 
-默认 CPU 参数：BF16、12 个计算线程、2 个 interop 线程、embedding 动态批处理 `2 ms / 32`、rerank block `16`、LoRA 按任务预合并开启（常驻内存约 6 GB：PEFT 原模型 + 4 份合并副本）。
+默认 CPU 参数：BF16、12 个计算线程、2 个 interop 线程、embedding 动态批处理 `2 ms / 32`、rerank block `16`、LoRA 按任务预合并**关闭**（内存与基线相同）。
 
 可按需覆盖：
 
@@ -41,7 +52,7 @@ $env:JINA_MODEL_DTYPE = "bfloat16"
 $env:JINA_EMBEDDING_BATCH_WINDOW_MS = "2"
 $env:JINA_EMBEDDING_BATCH_MAX_SIZE = "32"
 $env:JINA_RERANKER_BLOCK_SIZE = "16"
-$env:JINA_LORA_MERGE = "1"          # 0 = 回退到原生 PEFT 路径（省内存，慢 ~2-3x）
+$env:JINA_LORA_MERGE = "0"          # 1 = 按任务预合并 LoRA：串行再 -30%，代价 +4.8 GB 常驻内存
 ```
 
 ## Features

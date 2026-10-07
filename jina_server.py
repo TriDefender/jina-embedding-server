@@ -94,12 +94,14 @@ MODEL_DTYPE = {
 }.get(MODEL_DTYPE_NAME)
 if MODEL_DTYPE is None:
     raise ValueError("JINA_MODEL_DTYPE must be 'bfloat16', 'float16', or 'float32'")
-# Pre-merge each task's LoRA into a dedicated plain backbone copy. Measured on
-# the local 9900X: ~3x faster single-text forward and ~1.7x faster batch-10
-# forward vs unmerged PEFT (which pays per-module dispatch + extra matmuls on
-# every layer). Task switching stays runtime-cheap: the pool just re-points to
-# another merged copy. Set JINA_LORA_MERGE=0 to keep the stock PEFT path.
-LORA_MERGE_ENABLED = os.environ.get("JINA_LORA_MERGE", "1") not in {"0", "false", "False"}
+# Opt-in: pre-merge each task's LoRA into a dedicated plain backbone copy.
+# Measured on the local 9900X: ~3x faster single-text forward and ~1.7x
+# batch-10 forward vs unmerged PEFT — but it keeps 4 merged copies resident
+# (~+4.8 GB RAM), so it is OFF by default. Enable with JINA_LORA_MERGE=1 on
+# machines with RAM to spare. Task switching stays runtime-cheap either way:
+# with the pool it re-points to another merged copy; without it, PEFT's
+# set_adapter swaps module references.
+LORA_MERGE_ENABLED = os.environ.get("JINA_LORA_MERGE", "0") not in {"0", "false", "False"}
 # Eager mode avoids compile warmup/recompilation cost for variable-length API
 # traffic. Enable explicitly after benchmarking a stable production workload.
 TORCH_COMPILE_ENABLED = os.environ.get("JINA_TORCH_COMPILE", "0") not in {
@@ -298,6 +300,28 @@ class TaskModelPool(torch.nn.Module):
         )
 
 
+def _short_circuit_module_sweeps(model: torch.nn.Module) -> None:
+    """Instance-level to/_apply/train no-ops for the stock PEFT model.
+
+    Same rationale as TaskModelPool.to/_apply/train: SentenceTransformer.encode()
+    calls .eval() and .to() on the whole tree on EVERY request (~4.6k submodule
+    visits). The model serves from CPU in MODEL_DTYPE and stays in eval mode,
+    so the sweeps are semantically no-ops — we only skip their cost. Bound as
+    instance attributes so parent recursion (which reads child.train/_apply
+    from the instance) picks them up, without touching the library class.
+    Must be called AFTER the final .to(device, dtype) / .eval() on the model.
+    """
+    import types
+
+    def _noop(self, *args, **kwargs):
+        return self
+
+    model.train = types.MethodType(_noop, model)
+    model._apply = types.MethodType(_noop, model)
+    model.to = types.MethodType(_noop, model)
+    model.training = False
+
+
 def _encode_embeddings_sync(texts: List[str], encode_kwargs: Dict[str, Any]):
     """Run the blocking embedding model call outside the event loop."""
     if embedding_model is None:
@@ -327,8 +351,17 @@ def _patch_reranker_forward(model) -> None:
     this machine. Done at runtime (instead of editing modeling.py) so it
     survives re-downloading the model directory, which is git-ignored.
     """
+    # Under torch.compile the model is wrapped in OptimizedModule; patching
+    # that class would corrupt every compiled module in the process and miss
+    # the real class, so unwrap first.
+    if type(model).__name__ == "OptimizedModule":
+        model = model._orig_mod
     modeling = sys.modules.get(type(model).__module__)
     output_cls = getattr(modeling, "CausalLMOutputWithScores", None)
+    if output_cls is None:
+        raise RuntimeError(
+            "CausalLMOutputWithScores not found in reranker modeling module"
+        )
 
     def forward(self, *args, **kwargs):
         kwargs.pop("output_hidden_states", None)
@@ -350,18 +383,16 @@ def _patch_reranker_forward(model) -> None:
         scores = torch.nn.functional.cosine_similarity(
             doc_embeds, query_embeds.expand_as(doc_embeds), dim=-1
         ).squeeze(-1)
-        if output_cls is not None:
-            return output_cls(
-                loss=None,
-                logits=None,
-                scores=scores,
-                query_embeds=query_embeds,
-                doc_embeds=doc_embeds,
-                past_key_values=outputs.past_key_values,
-                hidden_states=None,
-                attentions=outputs.attentions,
-            )
-        return outputs
+        return output_cls(
+            loss=None,
+            logits=None,
+            scores=scores,
+            query_embeds=query_embeds,
+            doc_embeds=doc_embeds,
+            past_key_values=outputs.past_key_values,
+            hidden_states=None,
+            attentions=outputs.attentions,
+        )
 
     type(model).forward = forward
 
@@ -558,7 +589,6 @@ async def lifespan(app: FastAPI):
             _pool.merge_one("retrieval")
             _pool.set_adapter("retrieval")
             stage("LoRA pool installed, retrieval merged")
-
             def _merge_remaining():
                 # Brief grace period: don't contend with the first burst of
                 # real requests that typically arrives right after readiness.
@@ -567,19 +597,33 @@ async def lifespan(app: FastAPI):
                     if _task == "retrieval":
                         continue
                     t0 = time.perf_counter()
-                    _pool.merge_one(_task)
-                    print(
-                        f"  [MERGE] task '{_task}' merged in {time.perf_counter() - t0:.1f}s"
-                        f" ({_pool.merge_progress})",
-                        flush=True,
-                    )
+                    try:
+                        _pool.merge_one(_task)
+                        print(
+                            f"  [MERGE] task '{_task}' merged in {time.perf_counter() - t0:.1f}s"
+                            f" ({_pool.merge_progress})",
+                            flush=True,
+                        )
+                    except Exception as _e:
+                        # Isolate failures: the task stays on the PEFT fallback
+                        # (correct output, slower) instead of killing the merge
+                        # thread and stranding every later task too.
+                        print(
+                            f"  [MERGE] task '{_task}' FAILED ({_e}); "
+                            "staying on PEFT fallback",
+                            flush=True,
+                        )
                 # Warm each merged model once (oneDNN shape kernels + first
                 # forward on the fresh weights) so user requests never hit a
                 # cold path. Runs here instead of blocking startup; forwards
                 # go straight to the merged copy (not pool.set_adapter) so
-                # they never race the inference worker's active model.
+                # they never race the inference worker's active model. The
+                # tokenizer call must mirror custom_st's truncation settings:
+                # the shared Rust backend's truncation state is mutated per
+                # call, so a no-truncation call here could race the inference
+                # worker into encoding without truncation.
                 for _task in _task_names:
-                    if _task == "retrieval":
+                    if _task == "retrieval" or _task not in _pool.merged:
                         continue
                     try:
                         with torch.no_grad():
@@ -587,6 +631,8 @@ async def lifespan(app: FastAPI):
                                 [f"warmup {_task}"],
                                 return_tensors="pt",
                                 padding=True,
+                                truncation=True,
+                                max_length=_transformer.max_seq_length,
                             )
                             _pool.merged[_task](**_b)
                     except Exception as _e:  # warmup is best-effort
@@ -599,6 +645,16 @@ async def lifespan(app: FastAPI):
             # warmup encodes contends for all 12 threads and slows readiness.
         except Exception as e:
             print(f"      [WARN] LoRA merge pool failed, staying on PEFT: {e}")
+    else:
+        # Stock PEFT path: still short-circuit the per-request .to()/.eval()
+        # module-tree sweeps (see TaskModelPool.train/_apply notes). Measured
+        # ~-17 ms per single-text request and ~-21 ms per 10-text batch on
+        # this machine, at zero memory cost.
+        try:
+            _short_circuit_module_sweeps(embedding_model._first_module().model)
+            stage("PEFT sweep short-circuit applied")
+        except Exception as e:
+            print(f"      [WARN] sweep short-circuit failed: {e}")
 
     # Load reranker model
     print(f"\n[2/2] Loading reranker model from: {RERANKER_MODEL_PATH}")
