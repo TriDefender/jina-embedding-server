@@ -10,7 +10,9 @@ Endpoints:
 """
 
 import asyncio
+import copy
 import os
+import sys
 import time
 import uuid
 import json
@@ -92,6 +94,14 @@ MODEL_DTYPE = {
 }.get(MODEL_DTYPE_NAME)
 if MODEL_DTYPE is None:
     raise ValueError("JINA_MODEL_DTYPE must be 'bfloat16', 'float16', or 'float32'")
+# Opt-in: pre-merge each task's LoRA into a dedicated plain backbone copy.
+# Measured on the local 9900X: ~3x faster single-text forward and ~1.7x
+# batch-10 forward vs unmerged PEFT — but it keeps 4 merged copies resident
+# (~+4.8 GB RAM), so it is OFF by default. Enable with JINA_LORA_MERGE=1 on
+# machines with RAM to spare. Task switching stays runtime-cheap either way:
+# with the pool it re-points to another merged copy; without it, PEFT's
+# set_adapter swaps module references.
+LORA_MERGE_ENABLED = os.environ.get("JINA_LORA_MERGE", "0") not in {"0", "false", "False"}
 # Eager mode avoids compile warmup/recompilation cost for variable-length API
 # traffic. Enable explicitly after benchmarking a stable production workload.
 TORCH_COMPILE_ENABLED = os.environ.get("JINA_TORCH_COMPILE", "0") not in {
@@ -156,6 +166,7 @@ embedding_model = None
 reranker_model = None
 embedding_executor: ThreadPoolExecutor | None = None
 reranker_executor: ThreadPoolExecutor | None = None
+_merge_thread: threading.Thread | None = None
 reranker_lock = threading.Lock()  # Protects reranker_model._block_size mutations
 
 # In-memory storage for Files and Batches
@@ -165,10 +176,11 @@ batches_storage: Dict[str, Dict[str, Any]] = {}  # batch_id -> batch metadata
 # ---------------------------------------------------------------------------
 # Dynamic batching infrastructure for /v1/embeddings
 # ---------------------------------------------------------------------------
-# A short queue window preserves most burst batching while avoiding 50 ms of
-# avoidable latency for an isolated request. 32 requests matched the best
-# observed CPU encoder batch on this machine.
-BATCH_WINDOW_MS = max(0, int(os.environ.get("JINA_EMBEDDING_BATCH_WINDOW_MS", "5")))
+# A short queue window lets concurrent bursts coalesce into shared encode
+# batches (measured ~1.4x more req/s under 8 concurrent clients than an
+# immediate flush) while adding only ~2 ms to an isolated request. 32
+# requests matched the best observed CPU encoder batch on this machine.
+BATCH_WINDOW_MS = max(0, int(os.environ.get("JINA_EMBEDDING_BATCH_WINDOW_MS", "2")))
 BATCH_MAX_SIZE = max(1, int(os.environ.get("JINA_EMBEDDING_BATCH_MAX_SIZE", "32")))
 
 
@@ -190,6 +202,126 @@ _batch_flush_lock: asyncio.Lock | None = None
 _batch_timer_handle: asyncio.TimerHandle | None = None
 
 
+# ---------------------------------------------------------------------------
+# Per-task LoRA-merged model pool
+# ---------------------------------------------------------------------------
+# The embedding model is a Qwen3 backbone wrapped in PEFT with one LoRA
+# adapter per task. Unmerged PEFT forwards pay wrapper dispatch plus two
+# extra matmuls per target module on every layer (~3x slower at batch=1 on
+# this machine). The pool pre-merges each task adapter into its own plain
+# backbone copy in a background thread at startup; until a task's merged
+# copy exists, requests for that task fall back to the PEFT model.
+class TaskModelPool(torch.nn.Module):
+    """Serves per-task LoRA-merged plain backbone copies with PEFT fallback.
+
+    Drop-in replacement for the PEFT model inside custom_st.Transformer:
+    exposes set_adapter()/forward()/device and delegates unknown attributes.
+    """
+
+    def __init__(self, peft_model, task_names: List[str]):
+        super().__init__()
+        self.peft = peft_model
+        self.task_names = list(task_names)
+        self.merged = torch.nn.ModuleDict()
+        self._active_key: Optional[str] = None  # None -> peft, else task name
+        self._lock = threading.Lock()
+
+    # -- merge management (background thread) --------------------------------
+    @property
+    def merge_progress(self) -> str:
+        return f"{len(self.merged)}/{len(self.task_names)} tasks merged"
+
+    def merge_one(self, task: str) -> None:
+        """Merge one task adapter into a private plain-model copy."""
+        merged = copy.deepcopy(self.peft).merge_and_unload(adapter_names=[task])
+        merged.eval()
+        with self._lock:
+            self.merged[task] = merged
+
+    def _active_model(self) -> torch.nn.Module:
+        if self._active_key is None:
+            return self.peft
+        return self.merged[self._active_key]
+
+    # -- inference API (drop-in for the PEFT model) ---------------------------
+    def train(self, mode: bool = True):
+        # Inference-only pool. SentenceTransformer.encode() calls .eval() and
+        # .to() on the whole module tree on EVERY request; with peft + 4 merged
+        # copies that is ~90 ms of pure Python traversal per call. Children are
+        # put in eval mode once (at load / after each merge) instead.
+        return self
+
+    def _apply(self, fn, recurse=True):
+        # Shield the subtree from per-request .to() sweeps: ST's Module.to()
+        # recurses via _apply (not .to), so overriding to() alone is not
+        # enough. The pool always serves from CPU in MODEL_DTYPE.
+        return self
+
+    def to(self, *args, **kwargs):
+        # Pool always serves from CPU in MODEL_DTYPE; skip the per-call
+        # whole-tree sweep (semantically a no-op for this server).
+        return self
+
+    def set_adapter(self, task: str) -> None:
+        with self._lock:
+            if task in self.merged:
+                self._active_key = task
+            else:
+                # Not merged yet (or merging disabled): use PEFT with the
+                # requested adapter active. PEFT adapter activation only
+                # swaps module references, and the single inference worker
+                # serializes requests, so this is safe.
+                self.peft.set_adapter(task)
+                self._active_key = None
+
+    def forward(self, *args, **kwargs):
+        return self._active_model()(*args, **kwargs)
+
+    @property
+    def device(self):
+        return next(self._active_model().parameters()).device
+
+    def __getattr__(self, name):
+        # nn.Module.__getattr__ resolves registered parameters/buffers/modules
+        # (including self.peft itself); delegate anything else to the PEFT
+        # model so existing callers (config, tokenizer, ...) keep working.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            pass
+        _peft = self.__dict__.get("_modules", {}).get("peft")
+        if _peft is not None:
+            try:
+                return getattr(_peft, name)
+            except AttributeError:
+                pass
+        raise AttributeError(
+            f"{type(self).__name__} object has no attribute {name!r}"
+        )
+
+
+def _short_circuit_module_sweeps(model: torch.nn.Module) -> None:
+    """Instance-level to/_apply/train no-ops for the stock PEFT model.
+
+    Same rationale as TaskModelPool.to/_apply/train: SentenceTransformer.encode()
+    calls .eval() and .to() on the whole tree on EVERY request (~4.6k submodule
+    visits). The model serves from CPU in MODEL_DTYPE and stays in eval mode,
+    so the sweeps are semantically no-ops — we only skip their cost. Bound as
+    instance attributes so parent recursion (which reads child.train/_apply
+    from the instance) picks them up, without touching the library class.
+    Must be called AFTER the final .to(device, dtype) / .eval() on the model.
+    """
+    import types
+
+    def _noop(self, *args, **kwargs):
+        return self
+
+    model.train = types.MethodType(_noop, model)
+    model._apply = types.MethodType(_noop, model)
+    model.to = types.MethodType(_noop, model)
+    model.training = False
+
+
 def _encode_embeddings_sync(texts: List[str], encode_kwargs: Dict[str, Any]):
     """Run the blocking embedding model call outside the event loop."""
     if embedding_model is None:
@@ -206,6 +338,63 @@ async def _encode_embeddings(texts: List[str], encode_kwargs: Dict[str, Any]):
         list(texts),
         dict(encode_kwargs),
     )
+
+
+def _patch_reranker_forward(model) -> None:
+    """Bind a faster forward() onto the trust_remote_code reranker class.
+
+    The stock JinaForRanking.forward runs Qwen3ForCausalLM.forward with
+    output_hidden_states=True and then uses only the LAST layer, so every
+    call materializes all 29 per-layer hidden states (~243 MB of allocation
+    traffic at 4k tokens) and walks an identity lm_head. The patched forward
+    calls the Qwen3Model backbone directly — identical math, ~3% faster on
+    this machine. Done at runtime (instead of editing modeling.py) so it
+    survives re-downloading the model directory, which is git-ignored.
+    """
+    # Under torch.compile the model is wrapped in OptimizedModule; patching
+    # that class would corrupt every compiled module in the process and miss
+    # the real class, so unwrap first.
+    if type(model).__name__ == "OptimizedModule":
+        model = model._orig_mod
+    modeling = sys.modules.get(type(model).__module__)
+    output_cls = getattr(modeling, "CausalLMOutputWithScores", None)
+    if output_cls is None:
+        raise RuntimeError(
+            "CausalLMOutputWithScores not found in reranker modeling module"
+        )
+
+    def forward(self, *args, **kwargs):
+        kwargs.pop("output_hidden_states", None)
+        kwargs.pop("use_cache", None)
+        assert kwargs.pop("labels", None) is None, (
+            "labels should not be passed to forward()"
+        )
+        input_ids = kwargs.pop("input_ids", None)
+        outputs = self.model(input_ids=input_ids, use_cache=False, **kwargs)
+        hidden_states = outputs.last_hidden_state
+
+        batch_size, _, dim = hidden_states.shape
+        query_idx = torch.eq(input_ids, self.query_embed_token_id)
+        doc_idx = torch.eq(input_ids, self.doc_embed_token_id)
+        doc_embeds = hidden_states[doc_idx].view(batch_size, -1, dim)
+        query_embeds = hidden_states[query_idx].unsqueeze(1)
+        doc_embeds = self.projector(doc_embeds)
+        query_embeds = self.projector(query_embeds)
+        scores = torch.nn.functional.cosine_similarity(
+            doc_embeds, query_embeds.expand_as(doc_embeds), dim=-1
+        ).squeeze(-1)
+        return output_cls(
+            loss=None,
+            logits=None,
+            scores=scores,
+            query_embeds=query_embeds,
+            doc_embeds=doc_embeds,
+            past_key_values=outputs.past_key_values,
+            hidden_states=None,
+            attentions=outputs.attentions,
+        )
+
+    type(model).forward = forward
 
 
 def _rerank_sync(query: str, documents: List[str], top_n: Optional[int], batch_size: int):
@@ -321,7 +510,15 @@ async def _safe_flush():
 async def lifespan(app: FastAPI):
     """Load models on startup."""
     global embedding_model, reranker_model, _batch_flush_lock
-    global embedding_executor, reranker_executor
+    global embedding_executor, reranker_executor, _merge_thread
+
+    stage_t0 = time.perf_counter()
+
+    def stage(msg: str) -> None:
+        nonlocal stage_t0
+        now = time.perf_counter()
+        print(f"  [STARTUP] {msg} (+{now - stage_t0:.2f}s)", flush=True)
+        stage_t0 = now
 
     # Display CPU capabilities
     cpu_caps = check_cpu_capabilities()
@@ -360,6 +557,7 @@ async def lifespan(app: FastAPI):
         print(
             f"      [OK] Embedding model loaded (dim={embedding_model.get_sentence_embedding_dimension()})"
         )
+        stage("embedding model loaded")
     except Exception as e:
         print(f"      [FAIL] Failed to load embedding model: {e}")
         raise
@@ -374,7 +572,89 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"      [WARN] torch.compile() failed (falling back to eager): {e}")
     else:
-        print("\n[OPTIMIZE] torch.compile disabled by JINA_TORCH_COMPILE")
+        pass  # eager by default; see LORA_MERGE_ENABLED note above
+
+    # Install the per-task merged-model pool inside the SentenceTransformer
+    # pipeline (replaces the PEFT model object; custom_st keeps working since
+    # the pool exposes set_adapter/__call__/device).
+    if LORA_MERGE_ENABLED:
+        try:
+            _transformer = embedding_model._first_module()
+            _task_names = list(_transformer.config.task_names)
+            _pool = TaskModelPool(_transformer.model, _task_names)
+            _transformer.model = _pool
+            # Swap the most common task to a merged copy synchronously so the
+            # very first user request is already on the fast path; the rest
+            # merge in the background while the server serves traffic.
+            _pool.merge_one("retrieval")
+            _pool.set_adapter("retrieval")
+            stage("LoRA pool installed, retrieval merged")
+            def _merge_remaining():
+                # Brief grace period: don't contend with the first burst of
+                # real requests that typically arrives right after readiness.
+                time.sleep(3.0)
+                for _task in _task_names:
+                    if _task == "retrieval":
+                        continue
+                    t0 = time.perf_counter()
+                    try:
+                        _pool.merge_one(_task)
+                        print(
+                            f"  [MERGE] task '{_task}' merged in {time.perf_counter() - t0:.1f}s"
+                            f" ({_pool.merge_progress})",
+                            flush=True,
+                        )
+                    except Exception as _e:
+                        # Isolate failures: the task stays on the PEFT fallback
+                        # (correct output, slower) instead of killing the merge
+                        # thread and stranding every later task too.
+                        print(
+                            f"  [MERGE] task '{_task}' FAILED ({_e}); "
+                            "staying on PEFT fallback",
+                            flush=True,
+                        )
+                # Warm each merged model once (oneDNN shape kernels + first
+                # forward on the fresh weights) so user requests never hit a
+                # cold path. Runs here instead of blocking startup; forwards
+                # go straight to the merged copy (not pool.set_adapter) so
+                # they never race the inference worker's active model. The
+                # tokenizer call must mirror custom_st's truncation settings:
+                # the shared Rust backend's truncation state is mutated per
+                # call, so a no-truncation call here could race the inference
+                # worker into encoding without truncation.
+                for _task in _task_names:
+                    if _task == "retrieval" or _task not in _pool.merged:
+                        continue
+                    try:
+                        with torch.no_grad():
+                            _b = _transformer.tokenizer(
+                                [f"warmup {_task}"],
+                                return_tensors="pt",
+                                padding=True,
+                                truncation=True,
+                                max_length=_transformer.max_seq_length,
+                            )
+                            _pool.merged[_task](**_b)
+                    except Exception as _e:  # warmup is best-effort
+                        print(f"  [MERGE] warmup '{_task}' failed: {_e}", flush=True)
+
+            _merge_thread = threading.Thread(
+                target=_merge_remaining, name="lora-merge", daemon=True
+            )
+            # Started after the sync warmup below: merging in parallel with the
+            # warmup encodes contends for all 12 threads and slows readiness.
+        except Exception as e:
+            print(f"      [WARN] LoRA merge pool failed, staying on PEFT: {e}")
+    else:
+        # Stock PEFT path: still short-circuit the per-request .to()/.eval()
+        # module-tree sweeps (see TaskModelPool.train/_apply notes). Measured
+        # ~-17 ms per single-text request and ~-21 ms per 10-text batch on
+        # this machine, at zero memory cost.
+        try:
+            _short_circuit_module_sweeps(embedding_model._first_module().model)
+            stage("PEFT sweep short-circuit applied")
+        except Exception as e:
+            print(f"      [WARN] sweep short-circuit failed: {e}")
 
     # Load reranker model
     print(f"\n[2/2] Loading reranker model from: {RERANKER_MODEL_PATH}")
@@ -394,6 +674,11 @@ async def lifespan(app: FastAPI):
                 reranker_model, mode=TORCH_COMPILE_MODE, dynamic=True
             )
         print("      [OK] Reranker model loaded")
+        try:
+            _patch_reranker_forward(reranker_model)
+        except Exception as e:
+            print(f"      [WARN] reranker forward patch failed (using stock): {e}")
+        stage("reranker model loaded")
     except Exception as e:
         print(f"      [FAIL] Failed to load reranker model: {e}")
         raise
@@ -418,17 +703,36 @@ async def lifespan(app: FastAPI):
     print("Server ready!")
     print("=" * 60)
 
-    # Warmup: pre-allocate memory and trigger JIT compilation
+    # Warmup: pre-allocate memory, trigger oneDNN JIT kernel compilation and
+    # leave the fast path hot. Only the dominant retrieval workload (both
+    # prompt variants + a 32-text batch) and the reranker block the startup;
+    # the other tasks are warmed in the background merge thread.
     print("\n[WARMUP] Pre-warming models...")
+    warm_tasks = [
+        ("retrieval", "query"),
+        ("retrieval", "document"),
+    ]
+    warm_batch = [
+        "dummy_text_here_put_your_string_lol1234567890 vgyfsFewwg4rgeghrafW\tEDDDDD₫fvvv俄国v恶个过程各方位"
+    ]
+    for task, prompt in warm_tasks:
+        kwargs = {
+            "task": task,
+            "convert_to_numpy": False,
+            "normalize_embeddings": True,
+        }
+        if prompt is not None:
+            kwargs["prompt_name"] = prompt
+        _ = await _encode_embeddings(warm_batch, kwargs)
+    # batched shape warmup (32 short texts in one encode call)
     _ = await _encode_embeddings(
-        [
-            "dummy_text_here_put_your_string_lol1234567890 vgyfsFewwg4rgeghrafW	EDDDDD₫fvvv俄国v恶个过程各方位"
-        ],
+        [f"warmup text {i}" for i in range(32)],
         {
             "task": "retrieval",
             "prompt_name": "query",
             "convert_to_numpy": False,
             "normalize_embeddings": True,
+            "batch_size": 32,
         },
     )
     try:
@@ -438,9 +742,22 @@ async def lifespan(app: FastAPI):
             top_n=1,
             batch_size=64,
         )
+        _ = await _rerank_documents(
+            "warmup query",
+            [f"warmup document number {i} with some content" for i in range(16)],
+            top_n=1,
+            batch_size=16,
+        )
     except Exception:
         pass
     print("      [OK] Models pre-warmed")
+    stage("warmup done")
+
+    # Now that the server is warm and about to accept traffic, merge the
+    # remaining task adapters in the background (each takes ~1.5 s; until a
+    # task's merge lands, its requests use the stock PEFT path).
+    if _merge_thread is not None:
+        _merge_thread.start()
 
     try:
         yield
@@ -732,7 +1049,8 @@ async def create_embeddings(request: EmbeddingRequest):
         elapsed = time.time() - start_time
         print(
             f"  [INFO] Processed {len(texts)} texts in {elapsed:.2f}s "
-            f"({len(texts) / elapsed:.1f} texts/s)"
+            f"({len(texts) / elapsed:.1f} texts/s)",
+            flush=True,
         )
 
     # Build response
